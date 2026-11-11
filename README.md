@@ -130,6 +130,11 @@ Notes:
 * Memory per GPU is roughly `(N/P) * (N/Q) * 8` bytes plus about 4 GB of buffers. If N is too large, the run may fail late with an NCCL or CUDA error instead of a clear out-of-memory message.
 * If `/tmp` is read-only on compute nodes, set `TMPDIR=/dev/shm`.
 
+## Documentation
+* [docs/DESIGN.md](docs/DESIGN.md) - how CHPL works: data distribution, panel factorization, emulated DGEMM backends, communication
+* [docs/TUNING.md](docs/TUNING.md) - environment variable reference, choosing N and NB, accuracy margin, benchmarking methodology
+* [CHANGELOG.md](CHANGELOG.md) - release notes
+
 ## Testing CHPL
 At the end of each benchmark run, residual error checking is computed, and PASSED or FAILED is printed to output.
 
