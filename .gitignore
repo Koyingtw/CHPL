@@ -1,3 +1,25 @@
+# build artifacts
+/build/
+*.o
+*.a
+*.so
+
+# run logs / slurm output
+/logs/
+*.out
+*.err
+slurm-*.log
+
+# gemmul8 submodule's own build output (in case make is run in-place)
+/gemmul8/build/
+/gemmul8/lib/
+/gemmul8/compile_info
+
+# scratch / editor
+*.swp
+.DS_Store
+
+# CUDA intermediate files
 *.i
 *.ii
 *.gpu
