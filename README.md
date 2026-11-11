@@ -133,7 +133,7 @@ Performance is reported at the end of the run in FP64 floating point operations 
 
 Notes:
 * NB=4096 is the best block size for the GEMMul8 backend. NB of 6144 or more exceeds the shared-memory limit of one of the kernels.
-* Memory per GPU is roughly `(N/P) * (N/Q) * 8` bytes plus about 4 GB of buffers. If N is too large, the run may fail late with an NCCL or CUDA error instead of a clear out-of-memory message.
+* Memory per GPU is dominated by the local matrix, `(N/P) * (N/Q) * 8` bytes, plus panel buffers that grow with NB (about 17 GB per GPU for P4Q4, N=460800, NB=4096); see [docs/TUNING.md](docs/TUNING.md). If N is too large, the run may fail late with an NCCL or CUDA error instead of a clear out-of-memory message.
 * If `/tmp` is read-only on compute nodes, set `TMPDIR=/dev/shm`.
 
 ## Documentation
