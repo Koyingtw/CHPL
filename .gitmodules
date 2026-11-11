@@ -1,0 +1,4 @@
+[submodule "gemmul8"]
+	path = gemmul8
+	url = https://github.com/RIKEN-RCCS/GEMMul8.git
+	ignore = dirty

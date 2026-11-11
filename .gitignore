@@ -1,6 +1,22 @@
+# build output
+/build/
+*.o
+*.a
+*.so
+
+# run output
+HPL.out
+*.out
+*.err
+
+# CUDA intermediate files
 *.i
 *.ii
 *.gpu
 *.ptx
 *.cubin
 *.fatbin
+
+# editor
+*.swp
+.DS_Store
