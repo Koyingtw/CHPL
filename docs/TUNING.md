@@ -26,7 +26,7 @@ Contents:
 | 16 GPUs (2 nodes) | P4Q4 | `chpl_p4` | 460800 | 4096 | 989.1 | 1.94 | `mpirun_chpl -P 4 -Q 4 -N 460800 --NB 4096` |
 | 32 GPUs (4 nodes) | P4Q8 | `chpl_p4` | 622592 | 4096 | 1853 | 1.40 | `mpirun_chpl -P 4 -Q 8 -N 622592 --NB 4096` |
 
-Run-to-run spread on a fixed set of nodes was below 0.1% for every multi-GPU configuration. Residuals are deterministic: the same N, NB, grid and settings produce a bit-identical residual on every run.
+Run-to-run spread on a fixed set of nodes was 0.1–0.2% for every multi-GPU configuration. Residuals are deterministic: the same N, NB, grid and settings produce a bit-identical residual on every run.
 
 ### Settings behind each configuration
 
@@ -63,17 +63,17 @@ If that line is missing, GEMMul8 is not in use.
 
 ### Other GPU counts
 
-`chpl_p4` runs on any number of ranks divisible by 4, as long as each process column stays on one node (see [Choosing P](#choosing-p)). For example, 12 GPUs as P4Q3 with 8 + 4 block placement reached 724.2 TFLOPS (best of 3) at N = 405504, NB = 4096 with the same settings; N = 409600 ran out of memory. Start from the memory budget and step N down by NB until the run fits.
+`chpl_p4` runs on any number of ranks divisible by 4, as long as each process column stays on one node (see [Choosing P](#choosing-p)). For example, 12 GPUs as P4Q3 with 8 + 4 block placement reached 724.2 TFLOPS at N = 405504, NB = 4096 with the same settings; N = 409600 ran out of memory. Start from the memory budget and step N down by NB until the run fits.
 
 ### Ozaki-I fallback
 
-The Ozaki-I backend (`CHPL2D_G8=0 CHPL2D_OZ=1`) is kept as an alternative engine. It is 15–25% slower than GEMMul8 at every scale, and its best block size is NB = 2048. The best Ozaki-I results were:
+The Ozaki-I backend (`CHPL2D_G8=0 CHPL2D_OZ=1`) is kept as an alternative engine. It is 14–20% slower than GEMMul8 at every scale, and its best block size is NB = 2048. The best Ozaki-I results were:
 
 | Scale | Grid | N | NB | TFLOPS | Settings that differ from the GEMMul8 set |
 |---|---|---|---|---|---|
 | 8 GPUs | P2Q4 | 348160 | 2048 | 403 | `CHPL2D_G8=0 CHPL2D_OZ=1 NCCL_MAX_NCHANNELS=6` |
 | 16 GPUs | P4Q4 | 497664 | 2048 | 790 | `CHPL2D_G8=0 CHPL2D_OZ=1 NCCL_MAX_NCHANNELS=4` |
-| 32 GPUs | P4Q8 | 688128 | 2048 | 1593 | `CHPL2D_G8=0 CHPL2D_OZ=1` |
+| 32 GPUs | P4Q8 | 688128 | 2048 | 1593 | `CHPL2D_G8=0 CHPL2D_OZ=1 NCCL_MAX_NCHANNELS=4` |
 
 Ozaki-I residuals at these sizes are about 0.5–0.7.
 
@@ -115,7 +115,7 @@ These apply only with `CHPL2D_G8=0 CHPL2D_OZ=1`.
 
 | Variable | Binary | Code | Description |
 |---|---|---|---|
-| `CHPL2D_OZ_NT` | p2, p4 | 1024 | Column tile width of the int8 GEMMs. 1024 is clearly best. 768 is about 5% slower. 1280 is much slower (cuBLASLt has no good algorithm for that width). 1536 and 2048 are 2–3% slower. |
+| `CHPL2D_OZ_NT` | p2, p4 | 1024 | Column tile width of the int8 GEMMs. 1024 is clearly best. 768 is about 5% slower. 1280 is much slower (cuBLASLt has no good algorithm for that width). 1536 and 2048 are 1–3% slower. |
 | `CHPL2D_OZ_ALGO` | p2, p4 | 3 | Index into the cuBLASLt heuristic list used for the int8 GEMMs. 0 and 3 are within 1% of each other. 1 is about 25% slower. |
 | `CHPL2D_OZ_S`, `CHPL2D_OZ_D` | p2, p4 | 6, 5 | Number of int8 slices and fused diagonals. D = 5 is the accuracy floor (D = 4 fails the residual check). Do not change. |
 
@@ -240,7 +240,7 @@ The number of panels, ceil(N / NB), and how it falls across the Q process column
 
 The block size is tied to the backend:
 
-* **GEMMul8: NB = 4096.** A larger NB halves the number of panels, and so the total latency of the serial panel chain, and it doubles k for each emulated GEMM, which halves GEMMul8's per-element modular reduction and reconstruction overhead. Both effects outweigh the smaller N that the larger buffers force. At NB = 2048, GEMMul8 is slower than Ozaki-I. NB = 5120 runs but is about 4% slower (947 vs 989 TFLOPS at 16 GPUs), so the curve peaks at 4096.
+* **GEMMul8: NB = 4096.** A larger NB halves the number of panels, and so the total latency of the serial panel chain, and it doubles k for each emulated GEMM, which halves GEMMul8's per-element modular reduction and reconstruction overhead. Both effects outweigh the smaller N that the larger buffers force. At NB = 2048, GEMMul8 is no faster than Ozaki-I across nodes. NB = 5120 runs but is about 4% slower (947 vs 989 TFLOPS at 16 GPUs), so the curve peaks at 4096.
 * **Ozaki-I: NB = 2048.** Its int8 work is proportional to k, so it gains nothing from a larger NB and loses N (716 vs 792 TFLOPS at 16 GPUs with NB = 4096).
 * **NB ≥ 6144 cannot run.** The row-swap list kernel needs 40 × NB + 1024 bytes of shared memory per block, which exceeds the 227 KB per-block limit of Hopper at NB = 6144. The run fails at startup with `invalid argument` from `cudaFuncSetAttribute`.
 * **Other block sizes** (1536, 2560, 3072) have failed silently or hung inside cuSOLVER in the multi-GPU solvers. Stay with 2048 or 4096.
@@ -315,7 +315,7 @@ Differences between nodes are larger than most tuning effects, so compare carefu
 
 * **CUDA library path.** Put the lib64 directory of the CUDA toolkit you built against first in `LD_LIBRARY_PATH`. Loading cuBLAS and cuBLASLt from different CUDA versions (for example one from the HPC SDK and one from a system toolkit) can segfault at the first GEMM. `mpirun_chpl` forwards `LD_LIBRARY_PATH` to all ranks.
 * **Read-only `/tmp`.** `mpirun_chpl -N` writes a temporary input file to `$TMPDIR` (default `/tmp`). On compute nodes where `/tmp` is read-only, set `TMPDIR=/dev/shm`.
-* **Mixed InfiniBand / RoCE adapters.** If some nodes have both IB and RoCE ports, NCCL may pair incompatible ports when the layout is asymmetric ("Remote IB device is incompatible with the local RoCE"). Restrict NCCL to the IB ports with `NCCL_IB_HCA==<list of IB HCAs>`. Each port's link layer is in `/sys/class/infiniband/<hca>/ports/<n>/link_layer`.
+* **Mixed InfiniBand / RoCE adapters.** If some nodes have both IB and RoCE ports, NCCL may pair incompatible ports when the layout is asymmetric ("Remote IB device is incompatible with the local RoCE"). Restrict NCCL to the IB ports with an exact-match list, for example `NCCL_IB_HCA==mlx5_0,mlx5_3` (the leading `=` requests exact names). Each port's link layer is in `/sys/class/infiniband/<hca>/ports/<n>/link_layer`.
 * **Do not free and reallocate large buffers between runs.** CHPL allocates all large GPU buffers once and keeps them for the whole run. Repeatedly freeing and reallocating buffers of this size within one process has been observed to corrupt data at the driver level. If you embed the solver or loop over several problem sizes in one process, keep this pattern or start a new process for each run.
 * **Rebuild all binaries together.** An executable built before a feature existed silently ignores that feature's environment variables and runs the fallback path. After you update the source, rebuild every `chpl_*` binary and check the backend line at startup.
 * **Bad GPUs.** A node whose GPUs fail `cudaGetDeviceCount` or `cudaSetDevice` fails every binary. Exclude it rather than retrying.

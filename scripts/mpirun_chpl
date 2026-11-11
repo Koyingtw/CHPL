@@ -56,7 +56,8 @@ case "$P" in
      BIN="$BIN_DIR/chpl_single" ;;
   2) [[ "$Q" == 4 || "$Q" == 8 ]] || die "P=2 requires Q=4 or Q=8"
      BIN="$BIN_DIR/chpl_p2" ;;
-  4) BIN="$BIN_DIR/chpl_p4" ;;
+  4) BIN="$BIN_DIR/chpl_p4"
+     (( Q >= 4 )) || echo "mpirun_chpl: warning: P=4 with Q<4 is untested; use -P 2 for one node" >&2 ;;
   *) die "P must be 1, 2 or 4" ;;
 esac
 [[ -x "$BIN" || "$DRY" == 1 ]] || die "binary not found: $BIN"
@@ -107,11 +108,12 @@ fi
 if [[ "$P" == 2 ]]; then DEF_NT=2816; DEF_NCH=6; else DEF_NT=3072; DEF_NCH=8; fi
 declare -A DEF=(
   [CHPL2D_OZ]=0 [CHPL2D_G8]=1 [CHPL2D_G8_MODULI]=11 [CHPL2D_G8_FAST]=1
-  [CHPL2D_G8_NT]=$DEF_NT [CHPL2D_WCH]=4 [CHPL2D_PRESEL]=1 [CHPL2D_PRESEL2]=1
+  [CHPL2D_G8_NT]=$DEF_NT [CHPL2D_WCH]=4 [CHPL2D_PRESEL]=1
   [CHPL2D_WS]=64 [CHPL2D_XT]=6144
   [NCCL_MAX_NCHANNELS]=$DEF_NCH [NCCL_MIN_NCHANNELS]=1 [NCCL_BUFFSIZE]=2097152
   [CUDA_DEVICE_MAX_CONNECTIONS]=32
 )
+[[ "$P" == 4 ]] && DEF[CHPL2D_PRESEL2]=1   # read by chpl_p4 only
 XFLAGS=()
 for v in $(printf '%s\n' "${!DEF[@]}" | sort); do
   export "$v=${!v:-${DEF[$v]}}"
