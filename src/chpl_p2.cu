@@ -1,18 +1,21 @@
 /*
- * CHPL-2D — CUDA HPL with a P x Q = 2 x 4 process grid (8 GPUs).
+ * chpl_p2 -- CUDA HPL for NVIDIA Hopper (H200/H100), P x Q grid with P = 2.
  *
- * v1: correctness-first implementation.
- *  - rows block-cyclic over P=2 row-ranks, cols block-cyclic over Q=4
- *  - distributed panel factorization via tournament pivoting (CALU):
- *      local getrf -> candidate rows -> stacked getrf on row-rank 0 ->
- *      winners + [L11\U11]; L21 = A_local * inv(U11) computed locally
- *  - cross-rank row exchange with host-resolved net permutation
- *  - U12 = inv(L11) * P*A12 on the diagonal row-rank, broadcast down columns
- *  - trailing GEMM per rank; 2D block back-substitution; HPL residual check
- *  - single compute stream (lookahead is step 3)
+ * Runs on 8 or 16 MPI ranks (P2Q4 / P2Q8), one rank per GPU. Best choice
+ * for a single 8-GPU node.
  *
- * rank r -> pr = r % 2 (row rank), qc = r / 2 (col rank)
- * row block i -> pr = i % 2 ; col block j -> qc = j % 4
+ *  - 2D block-cyclic distribution, rank r -> pr = r % P, qc = r / P
+ *  - panel factorization with tournament pivoting (CALU), fp32 candidate
+ *    selection and exact fp64 refactorization of the winning rows
+ *  - trailing update with int8-emulated DGEMM: GEMMul8 (Ozaki-II, CRT,
+ *    CHPL2D_G8=1) or Ozaki-I digit slicing (CHPL2D_OZ=1)
+ *  - intra-node transfers through CUDA IPC + copy engines, NCCL otherwise
+ *  - standard HPL residual check
+ *
+ * Usage: mpirun -np <8|16> chpl_p2 HPL.dat   (reads N, NB and threshold)
+ *
+ * Part of CHPL. SPDX-License-Identifier: BSD-3-Clause
+ * Derived from the netlib HPL-2.3 benchmark; see THIRD_PARTY_NOTICES.md.
  */
 
 #include <cstdio>
@@ -35,8 +38,7 @@
 #include <cublasLt.h>
 #include <nccl.h>
 
-#include <gemmul8.hpp> /* RIKEN Ozaki-II CRT emulation (CHPL2D_G8 backend);
-                          minimal lib: scripts/build_gemmul8_min.sh */
+#include <gemmul8.hpp> /* RIKEN GEMMul8 (Ozaki-II CRT DGEMM emulation) */
 
 #define CHECK_CUDA(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
     fprintf(stderr, "[rank %d] CUDA error %s:%d: %s\n", g_rank, __FILE__, __LINE__, cudaGetErrorString(e_)); \
@@ -57,7 +59,7 @@
 static int g_rank = 0, g_size = 1;
 typedef unsigned long long u64;
 
-static int P = 4;
+static const int P = 2;
 static int Q = 4;
 
 /* ------------------------- kernels ------------------------------- */
@@ -236,41 +238,12 @@ __global__ void flag_wait_kernel(const volatile long long *f0,
         __nanosleep(200);
 }
 
-__global__ void winmap4_kernel(const int *top2, int jb, int e0, int e1,
-                               int e2, const int *prov, int NB_, int *win)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= jb) return;
-    int t = top2[i];
-    int p = t < e0 ? 0 : t < e1 ? 1 : t < e2 ? 2 : 3;
-    int base = p == 0 ? 0 : p == 1 ? e0 : p == 2 ? e1 : e2;
-    win[i] = prov[p * NB_ + (t - base)];
-}
-
-__global__ void win_gather4_kernel(const int *top, int jb, int e0, int e1,
-                                   int e2, int e3, const double *cand,
-                                   int NB_, double *out)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= jb) return;
-    int t = top[i];
-    int p = t < e0 ? 0 : t < e1 ? 1 : t < e2 ? 2 : 3;
-    int base = p == 0 ? 0 : p == 1 ? e0 : p == 2 ? e1 : e2;
-    int end = p == 0 ? e0 : p == 1 ? e1 : p == 2 ? e2 : e3;
-    const double *src = cand + (size_t)p * NB_ * NB_ + (t - base);
-    size_t lds = (size_t)(end - base);
-    for (int c = blockIdx.y * blockDim.y + threadIdx.y; c < jb;
-         c += gridDim.y * blockDim.y)
-        out[i + (size_t)c * jb] = src[(size_t)c * lds];
-}
-
-/* device closed-form lrows_below for P row ranks */
-__device__ __forceinline__ long long d_lrb(long long g, int NB_, int P_,
-                                           int pr_)
+/* device closed-form lrows_below for P=2 row ranks */
+__device__ __forceinline__ long long d_lrb(long long g, int NB_, int pr_)
 {
     long long nb = g / NB_;
-    long long full = (nb > pr_) ? (nb - pr_ - 1) / P_ + 1 : 0;
-    long long part = (nb % P_ == pr_) ? g - nb * NB_ : 0;
+    long long full = (nb > pr_) ? (nb - pr_ - 1) / 2 + 1 : 0;
+    long long part = (nb % 2 == pr_) ? g - nb * NB_ : 0;
     return full * NB_ + part;
 }
 
@@ -280,13 +253,13 @@ __device__ __forceinline__ long long d_lrb(long long g, int NB_, int P_,
  * bijection is a valid pivoting choice).  Outputs the five d_rows lists and
  * cnt = {ng, nsend, n1, n2}. */
 __global__ void buildlists_kernel(const int *win, long long gr0, int jb,
-                                  int NB_, int P_, int pr_, int *rows,
-                                  int *cnt)
+                                  int NB_, int pr_, int *rows, int *cnt)
 {
     extern __shared__ int sh[];
     int *chg_d = sh;              /* dst global rows, 2*jb */
     int *chg_s = chg_d + 2 * jb;  /* src global rows, 2*jb */
-    int *frees = chg_s + 2 * jb;  /* jb */
+    int *gpos  = chg_s + 2 * jb;  /* 2*jb */
+    int *frees = gpos + 2 * jb;   /* jb */
     int *displ = frees + jb;      /* jb */
     char *iswin = (char *)(displ + jb); /* jb */
     for (int i = threadIdx.x; i < jb; i += blockDim.x) iswin[i] = 0;
@@ -302,26 +275,28 @@ __global__ void buildlists_kernel(const int *win, long long gr0, int jb,
     for (int i = 0; i < jb; i++)
         if (!iswin[i]) displ[nd++] = (int)(gr0 + i);
     for (int i = 0; i < nf; i++) { chg_d[nchg] = frees[i]; chg_s[nchg] = displ[i]; nchg++; }
-    /* star topology on the diag-owner row: per-peer lists in the shared
-     * global (dst,src) order so pairwise orders match.
-     * rows layout: locsrc@0(2NB) locdst@2NB(2NB) send_p@(4+p)NB recv_p@(8+p)NB
-     * cnt: [n1, ns0..nsP-1, nr0..nrP-1] */
-    int n1 = 0, ns[8], nr[8];
-    for (int p = 0; p < P_; p++) { ns[p] = 0; nr[p] = 0; }
+    int ng = 0;
+    for (int t = 0; t < nchg; t++) {
+        long long src = chg_s[t];
+        if ((int)((src / NB_) % 2) == pr_) {
+            gpos[t] = ng;
+            rows[ng++] = (int)d_lrb(src, NB_, pr_);
+        } else gpos[t] = -1;
+    }
+    int nsend = 0, n1 = 0, n2 = 0;
     for (int t = 0; t < nchg; t++) {
         long long dst = chg_d[t], src = chg_s[t];
-        int dpr = (int)((dst / NB_) % P_), spr = (int)((src / NB_) % P_);
-        if (spr == pr_ && dpr == pr_) {
-            rows[n1] = (int)d_lrb(src, NB_, P_, pr_);
-            rows[2 * NB_ + n1] = (int)d_lrb(dst, NB_, P_, pr_); n1++;
-        } else if (spr == pr_) {
-            rows[(4 + dpr) * NB_ + ns[dpr]++] = (int)d_lrb(src, NB_, P_, pr_);
-        } else if (dpr == pr_) {
-            rows[(8 + spr) * NB_ + nr[spr]++] = (int)d_lrb(dst, NB_, P_, pr_);
-        }
+        int dpr = (int)((dst / NB_) % 2), spr = (int)((src / NB_) % 2);
+        if (spr == pr_ && dpr != pr_)
+            rows[2 * NB_ + nsend++] = (int)d_lrb(src, NB_, pr_);
+        if (dpr != pr_) continue;
+        int lr = (int)d_lrb(dst, NB_, pr_);
+        if (spr == pr_) {
+            rows[3 * NB_ + n1] = (int)d_lrb(src, NB_, pr_);
+            rows[5 * NB_ + n1] = lr; n1++;
+        } else rows[7 * NB_ + n2++] = lr;
     }
-    cnt[0] = n1;
-    for (int p = 0; p < P_; p++) { cnt[1 + p] = ns[p]; cnt[1 + P_ + p] = nr[p]; }
+    cnt[0] = ng; cnt[1] = nsend; cnt[2] = n1; cnt[3] = n2;
 }
 
 /* cast a double panel to float (for pivot-selection-only getrf) */
@@ -367,79 +342,6 @@ __global__ void axpby_res_kernel(const double *b, const double *ax,
 }
 
 /* ---------------- Ozaki int8 fp64-emulation kernels ---------------- */
-/* WI8v2: pack sliced int8 W-row digits AND the row's rsc scale into one
- * "wire" row (digits, then the scale as a trailing double at byte offset
- * scOff) so the WI8 broadcast can move both in a SINGLE NCCL call instead
- * of two (payload + a separate scale array).  ldWire is in int8 elements;
- * scOff (also elements) is s*k padded up to a multiple of 8 so the double
- * lands 8-byte aligned. */
-/* Root-side WI8v2 packer: ozsliceA_kernel ALREADY computed the tight
- * digits into ozSAt (needed by the digit GEMMs regardless) -- this just
- * COPIES those bytes into the padded wire row and appends the
- * already-computed row scale.  No re-derivation from d_W, no rint/scale
- * arithmetic: pure byte copy + one double write per row, far cheaper than
- * re-slicing from scratch. */
-__global__ void oz_wire_repack_kernel(const signed char *Sin, size_t ldIn,
-                                      int m, int k, const double *rsc,
-                                      signed char *Wire, size_t ldWire,
-                                      int s, size_t scOff)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= m) return;
-    const signed char *Si = Sin + (size_t)i * ldIn;
-    signed char *Do = Wire + (size_t)i * ldWire;
-    for (int j = blockIdx.y * blockDim.y + threadIdx.y; j < k;
-         j += gridDim.y * blockDim.y)
-        for (int p = 0; p < s; p++) Do[j + (size_t)p * k] = Si[j + (size_t)p * k];
-    if (blockIdx.y == 0 && threadIdx.y == 0)
-        *(double *)(Wire + (size_t)i * ldWire + scOff) = rsc[i];
-}
-
-/* WI8v2 receive side: from a wire row (digits + trailing scale), copy the
- * tight digit planes into the persistent Sout (same layout ozsliceA_kernel
- * would have produced, so it's usable as-is by the digit GEMMs) AND
- * reconstruct the fp64 W value in the same pass (one read of each byte). */
-__global__ void oz_wire_unpack_kernel(const signed char *Wire,
-                                      size_t ldWire, int m, int k,
-                                      double *W, size_t ldw,
-                                      signed char *Sout, size_t ldOut,
-                                      int ns, size_t scOff, double *rscOut)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= m) return;
-    const signed char *Si = Wire + (size_t)i * ldWire;
-    signed char *Do = Sout + (size_t)i * ldOut;
-    double rs = *(const double *)(Si + scOff);
-    if (blockIdx.y == 0 && threadIdx.y == 0) rscOut[i] = rs;
-    for (int j = blockIdx.y * blockDim.y + threadIdx.y; j < k;
-         j += gridDim.y * blockDim.y) {
-        double v = 0.0, f = 1.0 / 128.0;
-        for (int t = 0; t < ns; t++) {
-            signed char byte = Si[j + (size_t)t * k];
-            Do[j + (size_t)t * k] = byte;
-            v += byte * f;
-            f *= 1.0 / 128.0;
-        }
-        W[(size_t)j * ldw + i] = v * rs;
-    }
-}
-
-/* rebuild a 42-bit fp64 W from broadcast int8 slices (WI8 transport):
- * W[i,j] = rs[i] * sum_s S[i*ldS + s*k + j] * 128^-(s+1) */
-__global__ void ozrecW_kernel(const signed char *S, size_t ldS, int m, int k,
-                              const double *rs, double *W, size_t ldw, int ns)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= m) return;
-    for (int j = blockIdx.y * blockDim.y + threadIdx.y; j < k;
-         j += gridDim.y * blockDim.y) {
-        double v = 0.0, f = 1.0 / 128.0;
-        const signed char *Si = S + (size_t)i * ldS + j;
-        for (int t = 0; t < ns; t++) { v += Si[(size_t)t * k] * f; f *= 1.0 / 128.0; }
-        W[(size_t)j * ldw + i] = v * rs[i];
-    }
-}
-
 __global__ void ozrowscale_kernel(const double *A, size_t lda, int m, int k,
                                   double *rinv, double *rsc)
 {
@@ -618,19 +520,10 @@ int main(int argc, char **argv)
     CHECK_MPI(MPI_Init(&argc, &argv));
     CHECK_MPI(MPI_Comm_rank(MPI_COMM_WORLD, &g_rank));
     CHECK_MPI(MPI_Comm_size(MPI_COMM_WORLD, &g_size));
-    if (g_size % P != 0) {
-        if (!g_rank)
-            fprintf(stderr,
-                    "chpl2d requires ranks divisible by P=%d (got %d)\n",
-                    P, g_size);
+    if (g_size != 8 && g_size != 16) {
+        if (!g_rank) fprintf(stderr, "chpl_p2 requires 8 or 16 ranks\n");
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
-    if (g_size % 8 != 0 && !g_rank)
-        fprintf(stderr,
-                "[chpl2d] note: %d ranks (not 8*nodes) -- ensure a BLOCK rank "
-                "placement that keeps every ncol group (P=%d consecutive "
-                "ranks) on one node; the U-staging CE pulls require it\n",
-                g_size, P);
     Q = g_size / P;
     const int pr = g_rank % P, qc = g_rank / P;
 
@@ -639,14 +532,16 @@ int main(int argc, char **argv)
                                   MPI_INFO_NULL, &shm));
     int lrank = 0; CHECK_MPI(MPI_Comm_rank(shm, &lrank));
     /* same-node map: ranks sharing this shm communicator */
-    std::vector<int> samenode(g_size, 0);
+    int samenode[16] = {0};
     {
+        int wr[16]; wr[lrank] = g_rank;
         int shsz = 0; CHECK_MPI(MPI_Comm_size(shm, &shsz));
         std::vector<int> loc(shsz);
         CHECK_MPI(MPI_Allgather(&g_rank, 1, MPI_INT, loc.data(), 1, MPI_INT,
                                 shm));
         for (int i = 0; i < shsz; i++)
-            if (loc[i] < g_size) samenode[loc[i]] = 1;
+            if (loc[i] < 16) samenode[loc[i]] = 1;
+        (void)wr;
     }
     int ndev = 0; CHECK_CUDA(cudaGetDeviceCount(&ndev));
     CHECK_CUDA(cudaSetDevice(lrank % ndev));
@@ -654,16 +549,12 @@ int main(int argc, char **argv)
     MPI_Comm mrow, mcol;
     CHECK_MPI(MPI_Comm_split(MPI_COMM_WORLD, pr, qc, &mrow));
     CHECK_MPI(MPI_Comm_split(MPI_COMM_WORLD, qc, pr, &mcol));
-    ncclComm_t nworld, nworld2, nrow, ncol;
+    ncclComm_t nworld, nrow, ncol;
     {
         ncclUniqueId id;
         if (!g_rank) CHECK_NCCL(ncclGetUniqueId(&id));
         CHECK_MPI(MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD));
         CHECK_NCCL(ncclCommInitRank(&nworld, P * Q, id, g_rank));
-        ncclUniqueId idw2;
-        if (!g_rank) CHECK_NCCL(ncclGetUniqueId(&idw2));
-        CHECK_MPI(MPI_Bcast(&idw2, sizeof(idw2), MPI_BYTE, 0, MPI_COMM_WORLD));
-        CHECK_NCCL(ncclCommInitRank(&nworld2, P * Q, idw2, g_rank));
         int rr; CHECK_MPI(MPI_Comm_rank(mrow, &rr));
         ncclUniqueId idr;
         if (!rr) CHECK_NCCL(ncclGetUniqueId(&idr));
@@ -702,8 +593,6 @@ int main(int argc, char **argv)
     CHECK_CUDA(cudaStreamCreateWithPriority(&sP, cudaStreamNonBlocking, prHigh));
     cudaStream_t sW;       /* multi-node: W broadcast off the sP critical path */
     CHECK_CUDA(cudaStreamCreateWithPriority(&sW, cudaStreamNonBlocking, prHigh));
-    cudaStream_t sK;       /* pkg (inv-piece) broadcast prefetch stream */
-    CHECK_CUDA(cudaStreamCreateWithPriority(&sK, cudaStreamNonBlocking, prHigh));
     cublasHandle_t hb; CHECK_CUBLAS(cublasCreate(&hb));
     CHECK_CUBLAS(cublasSetStream(hb, s0));
     const size_t WSMB = (getenv("CHPL2D_WS") ? atoi(getenv("CHPL2D_WS")) : 256);
@@ -749,7 +638,7 @@ int main(int argc, char **argv)
     double *d_Wf;   /* fp32 panel (mloc x NB floats) or fp64 2NB x NB */
     CHECK_CUDA(cudaMalloc(&d_Wf,
         std::max((size_t)mloc * NB * 4, (size_t)2 * NB * NB * 8)));
-    double *d_cand;   CHECK_CUDA(cudaMalloc(&d_cand, (size_t)4 * NB * NB * 8));
+    double *d_cand;   CHECK_CUDA(cudaMalloc(&d_cand, (size_t)2 * NB * NB * 8));
     double *d_pkg[2];
     CHECK_CUDA(cudaMalloc(&d_pkg[0], (size_t)3 * NB * NB * 8));
     CHECK_CUDA(cudaMalloc(&d_pkg[1], (size_t)3 * NB * NB * 8));
@@ -767,19 +656,20 @@ int main(int argc, char **argv)
     double *d_Ms;     CHECK_CUDA(cudaMalloc(&d_Ms, (size_t)NB * XT * 8));
 
     double *d_xpack;
-    CHECK_CUDA(cudaMalloc(&d_xpack, (size_t)(2 * P + 2) * NB * XT * 8));
+    CHECK_CUDA(cudaMalloc(&d_xpack, (size_t)4 * NB * XT * 8));
     int *d_ipiv;      CHECK_CUDA(cudaMalloc(&d_ipiv, 2 * NB * 4));
     int *d_info;      CHECK_CUDA(cudaMalloc(&d_info, 4));
-    int *d_rows;      CHECK_CUDA(cudaMalloc(&d_rows, 12 * NB * 4));
+    int *d_rows;      CHECK_CUDA(cudaMalloc(&d_rows, 10 * NB * 4));
     float *d_sel;
-    CHECK_CUDA(cudaMalloc(&d_sel, (size_t)4 * NB * NB * 4));
-    int *d_top, *d_provA, *d_win, *d_cnt, *d_occ;
+    CHECK_CUDA(cudaMalloc(&d_sel, (size_t)2 * NB * NB * 4));
+    int *d_top, *d_prov0, *d_prov1, *d_win, *d_cnt, *d_occ;
     CHECK_CUDA(cudaMalloc(&d_top, 2 * NB * 4));
-    CHECK_CUDA(cudaMalloc(&d_provA, 4 * NB * 4));
+    CHECK_CUDA(cudaMalloc(&d_prov0, NB * 4));
+    CHECK_CUDA(cudaMalloc(&d_prov1, NB * 4));
     CHECK_CUDA(cudaMalloc(&d_win, NB * 4));
-    CHECK_CUDA(cudaMalloc(&d_cnt, 16 * 4));
+    CHECK_CUDA(cudaMalloc(&d_cnt, 4 * 4));
     CHECK_CUDA(cudaMalloc(&d_occ,
-        (size_t)(std::max(mloc, (long long)4 * NB) + NB) * 4));
+        (size_t)(std::max(mloc, (long long)2 * NB) + NB) * 4));
     CHECK_CUDA(cudaFuncSetAttribute(buildlists_kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize, 40 * NB + 1024));
 
@@ -799,14 +689,6 @@ int main(int argc, char **argv)
         getenv("CHPL2D_G8_FAST") ? atoi(getenv("CHPL2D_G8_FAST")) : 1;
     const long long G8_NT =
         getenv("CHPL2D_G8_NT") ? atoll(getenv("CHPL2D_G8_NT")) : 2048;
-    /* m-split W pipeline (row-packed broadcast + per-chunk consumption).
-     * MEASURED NO NET GAIN at 2 nodes: it does hide the W-broadcast wait
-     * (s0_gap 17s -> 5s) but the hiding is capped by how much W-independent
-     * work exists per panel (~one tile), so the stall just moves inside the
-     * first tile (s0_gemm 48s -> 60s); wall unchanged.  Kept as an option
-     * for larger-scale experiments where the broadcast is longer. */
-    const int g8_msplit = g8_on &&
-        (getenv("CHPL2D_G8_MSPLIT") ? atoi(getenv("CHPL2D_G8_MSPLIT")) : 0);
     if (g8_on) oz_on = 0; /* the two update engines are mutually exclusive */
     const int OZ_S = getenv("CHPL2D_OZ_S") ? atoi(getenv("CHPL2D_OZ_S")) : 6;
     const int OZ_D = getenv("CHPL2D_OZ_D") ? atoi(getenv("CHPL2D_OZ_D")) : 5;
@@ -817,19 +699,6 @@ int main(int argc, char **argv)
      * int8 path: the DMMA pipe is otherwise idle while IMMA runs. */
     const int OZ_FP = getenv("CHPL2D_OZ_FP") ? atoi(getenv("CHPL2D_OZ_FP")) : 25;
     signed char *ozSA = nullptr, *ozSB = nullptr;
-    signed char *ozSAt[2] = {nullptr, nullptr};
-    double *ozRs2[2] = {nullptr, nullptr};
-    /* WI8v2: merge the int8-payload + row-scale broadcasts into ONE NCCL
-     * call per row-chunk (see oz_wire_pack/unpack_kernel).  Each wire row
-     * is [OZ_S*jb digit bytes, padded to 8B][8B trailing double scale]; a
-     * dedicated staging buffer (NOT the persistent ozSAt) is broadcast,
-     * then unpacked into ozSAt (tight, unmodified layout for the digit
-     * GEMMs) + reconstructed into d_W in the same pass.  Implies wi8. */
-    const int wi8v2 = getenv("CHPL2D_WI8V2") ? atoi(getenv("CHPL2D_WI8V2")) : 0;
-    const int wi8 =
-        (getenv("CHPL2D_WI8") ? atoi(getenv("CHPL2D_WI8")) : 0) || wi8v2;
-    signed char *ozWireAt[2] = {nullptr, nullptr};
-    size_t oz_ldWire = 0, oz_scOff = 0;
     int *ozDg[2][6] = {};
     cudaStream_t sOz = nullptr, sFp = nullptr;
     cublasHandle_t hbF = nullptr;
@@ -840,28 +709,7 @@ int main(int argc, char **argv)
     cublasLtMatmulPreference_t ozPref = nullptr;
     void *ozWs = nullptr; const size_t ozWsz = 256u << 20;
     if (oz_on) {
-        if (!wi8) CHECK_CUDA(cudaMalloc(&ozSA, (size_t)OZ_S * mloc * NB));
-        else {
-            for (int t = 0; t < 2; t++) {
-                CHECK_CUDA(cudaMalloc(&ozSAt[t], (size_t)OZ_S * mloc * NB));
-                /* persistent, panel-parity-buffered row-scale (written on
-                 * sW during chainB(k), read on s0 for panel k while
-                 * chainB(k+1) may already be writing the OTHER parity's
-                 * slot -- must be parity-split, unlike the transient
-                 * ozRinv/ozRsc scratch used only within one chunk's
-                 * pack step). */
-                CHECK_CUDA(cudaMalloc(&ozRs2[t], mloc * 8));
-            }
-            if (wi8v2) {
-                const size_t ldSw_w = (size_t)OZ_S * NB;
-                oz_scOff = ((ldSw_w + 7) / 8) * 8;
-                oz_ldWire = oz_scOff + 8;
-                const size_t rowsPerChunk = (size_t)(mloc + WCH - 1) / WCH;
-                for (int t = 0; t < 2; t++)
-                    CHECK_CUDA(cudaMalloc(&ozWireAt[t],
-                                          rowsPerChunk * oz_ldWire));
-            }
-        }
+        CHECK_CUDA(cudaMalloc(&ozSA, (size_t)OZ_S * mloc * NB));
         CHECK_CUDA(cudaMalloc(&ozSB, (size_t)OZ_S * NB * nloc));
         for (int ss = 0; ss < 2; ss++)
             for (int d = 0; d < 6; d++)
@@ -894,113 +742,30 @@ int main(int argc, char **argv)
         CHECK_CUBLAS(cublasLtMatmulPreferenceSetAttribute(ozPref,
             CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ozWsz, sizeof(ozWsz)));
         CHECK_CUDA(cudaMalloc(&ozWs, ozWsz));
-        if (!g_rank) printf("[chpl2d] OZ int8 emulation on: S=%d D=%d\n",
+        if (!g_rank) printf("[chpl_p2] OZ int8 emulation on: S=%d D=%d\n",
                             OZ_S, OZ_D);
     }
     void *g8_work = nullptr;
-    void *g8_workA[8] = {};
     double *d_Mg8 = nullptr;
     cublasHandle_t hbG8 = nullptr;
     if (g8_on) {
-        /* m-split workspaces: the update runs per W row chunk (m <= rch_max
-         * = ceil(mloc/WCH)), so the B/C scratch (g8_work, reused serially
-         * by every chunk) is sized for rch_max rows -- ~WCH x smaller than
-         * a full-m workspace -- while each chunk owns a private quantized-A
-         * slot (g8_workA[cw]) for skip_scalA reuse across the panel's
-         * tiles.  n = G8_NT + 1024 (small column tails absorbed). */
-        const long long rch_max = g8_msplit
-            ? ((long long)mloc + WCH - 1) / WCH
-            : (long long)mloc;
-        size_t wsA_c = 0, wsB_c = 0;
+        /* workspace sized for the largest call: m = mloc, n = G8_NT + 1024
+         * (column tails < 1024 are absorbed into the previous tile), k = NB,
+         * with the skip_scalA slice reserved for W reuse across tiles */
         const size_t g8_wsz = gemmul8::workSize<false, gemmul8::Backend::INT8>(
-            (size_t)rch_max, (size_t)(G8_NT + 1024), (size_t)NB, G8_MODULI,
-            true, /*enable_skip_scalB=*/g8_msplit, &wsA_c, &wsB_c);
-        CHECK_CUDA(cudaMalloc(&g8_work, g8_wsz + 256));
-        /* barrier mode keeps A inside g8_work (workA=nullptr); only the
-         * m-split mode needs per-chunk external A slots */
-        for (int cw = 0; cw < (g8_msplit ? WCH : 0); cw++)
-            CHECK_CUDA(cudaMalloc(&g8_workA[cw], wsA_c + 256));
+            (size_t)mloc, (size_t)(G8_NT + 1024), (size_t)NB, G8_MODULI,
+            true, false);
+        CHECK_CUDA(cudaMalloc(&g8_work, g8_wsz));
         CHECK_CUDA(cudaMalloc(&d_Mg8, (size_t)NB * (G8_NT + 1024) * 8));
         CHECK_CUBLAS(cublasCreate(&hbG8));
         CHECK_CUBLAS(cublasSetStream(hbG8, s0));
         { void *w; if (cudaMalloc(&w, 64u << 20) == cudaSuccess)
               CHECK_CUBLAS(cublasSetWorkspace(hbG8, w, 64u << 20)); }
         if (!g_rank)
-            printf("[chpl2d] G8 backend on: moduli=%d fast=%d nt=%lld "
-                   "work=%.2f+%dx%.2f GiB (m-split x%d)\n", G8_MODULI,
-                   G8_FAST, G8_NT, g8_wsz / 1073741824.0, WCH,
-                   wsA_c / 1073741824.0, WCH);
+            printf("[chpl_p2] G8 backend on: moduli=%d fast=%d nt=%lld "
+                   "work=%.2f GiB\n", G8_MODULI, G8_FAST, G8_NT,
+                   g8_wsz / 1073741824.0);
     }
-    /* per-diagonal measured-best heuristic index.  int8->int32 GEMM is
-     * exact, so any algo gives bit-identical C: safe to pick the fastest.
-     * CHPL2D_OZ_ALGD=i0,..,i5 pins manually; CHPL2D_OZ_BENCH=1 measures at
-     * startup (m = mloc, the flops-dominant shape). */
-    int g_algd[6] = {-1, -1, -1, -1, -1, -1};
-    if (oz_on && getenv("CHPL2D_OZ_ALGD")) {
-        sscanf(getenv("CHPL2D_OZ_ALGD"), "%d,%d,%d,%d,%d,%d", &g_algd[0],
-               &g_algd[1], &g_algd[2], &g_algd[3], &g_algd[4], &g_algd[5]);
-    } else if (oz_on && getenv("CHPL2D_OZ_BENCH") &&
-               atoi(getenv("CHPL2D_OZ_BENCH"))) {
-        cublasLtMatmulDesc_t opB;
-        CHECK_CUBLAS(cublasLtMatmulDescCreate(&opB, CUBLAS_COMPUTE_32I,
-                                              CUDA_R_32I));
-        cublasOperation_t bta = CUBLAS_OP_T, btb = CUBLAS_OP_N;
-        CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(opB,
-            CUBLASLT_MATMUL_DESC_TRANSA, &bta, sizeof(bta)));
-        CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(opB,
-            CUBLASLT_MATMUL_DESC_TRANSB, &btb, sizeof(btb)));
-        const size_t bldS = (size_t)OZ_S * NB;
-        cudaEvent_t be0, be1;
-        CHECK_CUDA(cudaEventCreate(&be0));
-        CHECK_CUDA(cudaEventCreate(&be1));
-        for (int d = 0; d <= OZ_D; d++) {
-            long long kd = (long long)(std::min(d, OZ_S - 1) + 1) * NB;
-            cublasLtMatrixLayout_t la, lb, lc;
-            CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&la, CUDA_R_8I, kd, mloc,
-                                                    bldS));
-            CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&lb, CUDA_R_8I, kd,
-                                                    OZ_NT, bldS));
-            CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&lc, CUDA_R_32I, mloc,
-                                                    OZ_NT, mloc));
-            cublasLtMatmulHeuristicResult_t hr[16];
-            int nh = 0;
-            CHECK_CUBLAS(cublasLtMatmulAlgoGetHeuristic(ozLt, opB, la, lb,
-                                                        lc, lc, ozPref, 16,
-                                                        hr, &nh));
-            int ia = 1, ib = 0, bi = 0;
-            float best = 1e30f;
-            for (int i = 0; i < nh; i++) {
-                if (cublasLtMatmul(ozLt, opB, &ia, wi8 ? ozSAt[0] : ozSA, la, ozSB, lb, &ib,
-                                   ozDg[0][d], lc, ozDg[0][d], lc,
-                                   &hr[i].algo, ozWs, ozWsz,
-                                   s0) != CUBLAS_STATUS_SUCCESS)
-                    continue;
-                CHECK_CUDA(cudaEventRecord(be0, s0));
-                for (int r = 0; r < 3; r++)
-                    cublasLtMatmul(ozLt, opB, &ia, wi8 ? ozSAt[0] : ozSA, la, ozSB, lb, &ib,
-                                   ozDg[0][d], lc, ozDg[0][d], lc,
-                                   &hr[i].algo, ozWs, ozWsz, s0);
-                CHECK_CUDA(cudaEventRecord(be1, s0));
-                CHECK_CUDA(cudaEventSynchronize(be1));
-                float ms;
-                CHECK_CUDA(cudaEventElapsedTime(&ms, be0, be1));
-                if (ms < best) { best = ms; bi = i; }
-            }
-            g_algd[d] = bi;
-            if (!g_rank)
-                fprintf(stderr, "[ozbench] d=%d nh=%d best_idx=%d %.3fms\n",
-                        d, nh, bi, best / 3);
-            cublasLtMatrixLayoutDestroy(la);
-            cublasLtMatrixLayoutDestroy(lb);
-            cublasLtMatrixLayoutDestroy(lc);
-        }
-        cublasLtMatmulDescDestroy(opB);
-        CHECK_CUDA(cudaEventDestroy(be0));
-        CHECK_CUDA(cudaEventDestroy(be1));
-        fflush(stderr);
-    }
-    signed char *curSA = ozSA;   /* WI8: per-parity slice transport buffer */
-    double *curRs = ozRsc;
     /* one emulated update: C(m x n, ld lda) -= W(m x k) * M(k x n),
      * using pre-sliced SA (this iteration) and SB (this chunk, col offset
      * cB into ozCinv/ozCsc).  n tiled by OZ_NT. */
@@ -1018,7 +783,7 @@ int main(int argc, char **argv)
         /* per-diagonal layouts + heuristics, hoisted out of the tile loop */
         long long ntail = (n % OZ_NT) && (n > OZ_NT) ? n % OZ_NT : 0;
         cublasLtMatrixLayout_t laD[6], lbD[6], lcD[6], lbDt[6], lcDt[6];
-        cublasLtMatmulHeuristicResult_t hD[6][16], hDt[6][16];
+        cublasLtMatmulHeuristicResult_t hD[6][4], hDt[6][4];
         for (int d = 0; d <= OZ_D; d++) {
             long long kd = (long long)(std::min(d, OZ_S - 1) + 1) * kk;
             int nh = 0;
@@ -1029,12 +794,8 @@ int main(int argc, char **argv)
             CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&lcD[d], CUDA_R_32I, m,
                 std::min(n, OZ_NT), m));
             CHECK_CUBLAS(cublasLtMatmulAlgoGetHeuristic(ozLt, opI, laD[d],
-                lbD[d], lcD[d], lcD[d], ozPref, 16, hD[d], &nh));
-            {
-                int ai = g_algd[d] >= 0 ? g_algd[d] : OZ_ALGO;
-                if (nh > ai) hD[d][0] = hD[d][ai];
-                else if (nh > OZ_ALGO) hD[d][0] = hD[d][OZ_ALGO];
-            }
+                lbD[d], lcD[d], lcD[d], ozPref, 4, hD[d], &nh));
+            if (nh > OZ_ALGO) hD[d][0] = hD[d][OZ_ALGO];
             if (!nh) {
                 fprintf(stderr, "[rank %d] oz: no algo d=%d m=%lld\n",
                         g_rank, d, m);
@@ -1046,12 +807,8 @@ int main(int argc, char **argv)
                 CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&lcDt[d], CUDA_R_32I,
                     m, ntail, m));
                 CHECK_CUBLAS(cublasLtMatmulAlgoGetHeuristic(ozLt, opI, laD[d],
-                    lbDt[d], lcDt[d], lcDt[d], ozPref, 16, hDt[d], &nh));
-                {
-                    int ai = g_algd[d] >= 0 ? g_algd[d] : OZ_ALGO;
-                    if (nh > ai) hDt[d][0] = hDt[d][ai];
-                    else if (nh > OZ_ALGO) hDt[d][0] = hDt[d][OZ_ALGO];
-                }
+                    lbDt[d], lcDt[d], lcDt[d], ozPref, 4, hDt[d], &nh));
+                if (nh > OZ_ALGO) hDt[d][0] = hDt[d][OZ_ALGO];
                 if (!nh) {
                     fprintf(stderr, "[rank %d] oz: no tail algo d=%d\n",
                             g_rank, d);
@@ -1070,7 +827,7 @@ int main(int argc, char **argv)
                 int lo = (d >= OZ_S) ? d - OZ_S + 1 : 0; /* first valid p */
                 (void)lo; /* OZ_D <= OZ_S-1 keeps lo == 0 */
                 int ia = 1, ib = 0;
-                CHECK_CUBLAS(cublasLtMatmul(ozLt, opI, &ia, curSA,
+                CHECK_CUBLAS(cublasLtMatmul(ozLt, opI, &ia, ozSA,
                     laD[d], Bt + (size_t)(OZ_S - 1 - d) * kk,
                     istail ? lbDt[d] : lbD[d], &ib, ozDg[set][d],
                     istail ? lcDt[d] : lcD[d], ozDg[set][d],
@@ -1086,7 +843,7 @@ int main(int argc, char **argv)
                 ozrecon_kernel<<<grd, blk, 0, sOz>>>(
                     Cp + (size_t)t0 * lda, lda, (int)m, (int)nt,
                     ozDg[set][0], ozDg[set][1], ozDg[set][2], ozDg[set][3],
-                    ozDg[set][4], ozDg[set][5], OZ_D + 1, curRs,
+                    ozDg[set][4], ozDg[set][5], OZ_D + 1, ozRsc,
                     ozCsc + cB + t0);
             }
             CHECK_CUDA(cudaEventRecord(evOzRecon[set], sOz));
@@ -1108,8 +865,7 @@ int main(int argc, char **argv)
     CHECK_CUDA(cudaMalloc(&d_x, (size_t)N * 8));
     CHECK_CUDA(cudaMalloc(&d_acc, (size_t)mloc * 8));
     CHECK_CUDA(cudaMalloc(&d_tmp, (size_t)NB * 8));
-    double *d_tmp3;
-    CHECK_CUDA(cudaMalloc(&d_tmp3, (size_t)std::max(Q - 1, 1) * NB * 8));
+    double *d_tmp3; CHECK_CUDA(cudaMalloc(&d_tmp3, (size_t)7 * NB * 8));
     CHECK_CUDA(cudaMalloc(&d_rs, (size_t)mloc * 8));
     CHECK_CUDA(cudaMalloc(&d_b, (size_t)mloc * 8));
     CHECK_CUDA(cudaMalloc(&d_r, (size_t)mloc * 8));
@@ -1120,10 +876,10 @@ int main(int argc, char **argv)
     long long *d_flags; CHECK_CUDA(cudaMalloc(&d_flags, 8 * 8));
     CHECK_CUDA(cudaMemset(d_flags, 0, 8 * 8));
     struct PeerBufs { double *W[2], *U[2], *acc, *tmp, *xp; long long *flags; };
-    std::vector<PeerBufs> peer(g_size);
+    PeerBufs peer[16] = {};
     {
         struct H { cudaIpcMemHandle_t hW[2], hU[2], hF, hAcc, hTmp, hXp; };
-        H mine; std::vector<H> all(g_size);
+        H mine, all[16];
         CHECK_CUDA(cudaIpcGetMemHandle(&mine.hW[0], d_W[0]));
         CHECK_CUDA(cudaIpcGetMemHandle(&mine.hW[1], d_W[1]));
         CHECK_CUDA(cudaIpcGetMemHandle(&mine.hU[0], d_U[0]));
@@ -1132,8 +888,8 @@ int main(int argc, char **argv)
         CHECK_CUDA(cudaIpcGetMemHandle(&mine.hAcc, d_acc));
         CHECK_CUDA(cudaIpcGetMemHandle(&mine.hTmp, d_tmp));
         CHECK_CUDA(cudaIpcGetMemHandle(&mine.hXp, d_xpack));
-        CHECK_MPI(MPI_Allgather(&mine, sizeof(H), MPI_BYTE, all.data(),
-                                sizeof(H), MPI_BYTE, MPI_COMM_WORLD));
+        CHECK_MPI(MPI_Allgather(&mine, sizeof(H), MPI_BYTE, all, sizeof(H),
+                                MPI_BYTE, MPI_COMM_WORLD));
         for (int r = 0; r < P * Q; r++) {
             if (!samenode[r] && r != g_rank) continue; /* IPC is intra-node */
             if (r == g_rank) {
@@ -1160,28 +916,20 @@ int main(int argc, char **argv)
         }
     }
     /* same-pr row peers (for W) and the ncol partner (for U) */
-    std::vector<int> rowpeer(Q > 0 ? Q - 1 : 0); { int t = 0;
+    int rowpeer[7]; { int t = 0;
         for (int q2 = 0; q2 < Q; q2++)
-            if (q2 != qc) rowpeer[t++] = pr + P * q2; }
-
+            if (q2 != qc) rowpeer[t++] = pr + 2 * q2; }
+    const int upartner = (1 - pr) + 2 * qc;
     /* the W data plane uses CE pulls only when all row peers share the
      * node (single-node runs); across nodes it broadcasts via NCCL */
     int wce = 1;
     for (int t = 0; t < Q - 1; t++)
         if (!samenode[rowpeer[t]]) wce = 0;
-    if (wi8 && wce) {
-        if (!g_rank) fprintf(stderr, "CHPL2D_WI8 requires multi-node (wce=0)\n");
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-    /* G8 m-split mode repacks the W broadcast into ROW chunks (dense rn x jb
-     * blocks, see the producer); the CE pull path reads the plain
-     * column-major W layout, so force NCCL when m-split is on. */
-    if (g8_msplit) wce = 0;
     int lwork = 0, lwork2 = 0, lworks = 0;
     CHECK_CUSOLVER(cusolverDnDgetrf_bufferSize(cs, (int)mloc, NB, d_Wf,
                                                (int)std::max(mloc, (long long)1),
                                                &lwork));
-    CHECK_CUSOLVER(cusolverDnDgetrf_bufferSize(cs, 4 * NB, NB, d_cand, 4 * NB,
+    CHECK_CUSOLVER(cusolverDnDgetrf_bufferSize(cs, 2 * NB, NB, d_cand, 2 * NB,
                                                &lwork2));
     CHECK_CUSOLVER(cusolverDnSgetrf_bufferSize(cs, (int)mloc, NB,
                                                (float *)d_Wf,
@@ -1198,37 +946,7 @@ int main(int argc, char **argv)
     int *d_provP;    CHECK_CUDA(cudaMalloc(&d_provP, NB * 4));
     int *d_occ2;
     CHECK_CUDA(cudaMalloc(&d_occ2,
-        (size_t)(std::max(mloc, (long long)4 * NB) + NB) * 4));
-    /* stage-2 preselect (PRESEL2): private buffers so the full tournament
-     * (grow_gather + candidate exchange + stacked getrf + inv pieces) can
-     * run on sSel during chainB(k-1), off the sP critical chain */
-    const int presel2 =
-        getenv("CHPL2D_PRESEL2") ? atoi(getenv("CHPL2D_PRESEL2")) : 0;
-    double *d_candP = nullptr, *d_pkgP[2] = {nullptr, nullptr};
-    float *d_selP = nullptr;
-    int *d_provAP = nullptr, *d_win2[2] = {nullptr,nullptr}, *d_rows9P = nullptr,
-        *d_top3 = nullptr;
-    if (presel2) {
-        CHECK_CUDA(cudaMalloc(&d_candP, (size_t)4 * NB * NB * 8));
-        CHECK_CUDA(cudaMalloc(&d_selP, (size_t)4 * NB * NB * 4));
-        CHECK_CUDA(cudaMalloc(&d_pkgP[0], (size_t)3 * NB * NB * 8));
-        CHECK_CUDA(cudaMalloc(&d_pkgP[1], (size_t)3 * NB * NB * 8));
-        CHECK_CUDA(cudaMalloc(&d_provAP, 4 * NB * 4));
-        CHECK_CUDA(cudaMalloc(&d_win2[0], NB * 4));
-        CHECK_CUDA(cudaMalloc(&d_win2[1], NB * 4));
-        CHECK_CUDA(cudaMalloc(&d_rows9P, NB * 4));
-        CHECK_CUDA(cudaMalloc(&d_top3, 2 * NB * 4));
-    }
-    cusolverDnHandle_t cs3 = nullptr;
-    cublasHandle_t hb3 = nullptr;
-    double *d_work3 = nullptr;
-    if (presel2) { CHECK_CUSOLVER(cusolverDnCreate(&cs3));
-                   CHECK_CUSOLVER(cusolverDnSetStream(cs3, sSel));
-                   CHECK_CUBLAS(cublasCreate(&hb3));
-                   CHECK_CUBLAS(cublasSetStream(hb3, sSel));
-                   { void *w; if (cudaMalloc(&w, 64u << 20) == cudaSuccess)
-                         CHECK_CUBLAS(cublasSetWorkspace(hb3, w, 64u << 20)); }
-                   CHECK_CUDA(cudaMalloc(&d_work3, (size_t)lwork * 8)); }
+        (size_t)(std::max(mloc, (long long)2 * NB) + NB) * 4));
 
     for (long long c0 = 0; c0 < nloc; c0 += 32768) {
         int nc = (int)std::min((long long)32768, nloc - c0);
@@ -1252,10 +970,6 @@ int main(int argc, char **argv)
     std::vector<cudaEvent_t> evReadyW(npan + 1), evUpd(npan + 1), evXg0(npan + 1);
     std::vector<std::array<cudaEvent_t, 8>> evWc(npan + 1);
     std::vector<cudaEvent_t> evD2s(npan + 1), evSel(npan + 1), evCand(npan + 1);
-    std::vector<cudaEvent_t> evSel2(npan + 1);  /* stage-2 preselect done */
-    std::vector<cudaEvent_t> evPkgS(npan + 1), evPkg(npan + 1);
-    const int pkgpre =
-        getenv("CHPL2D_PKGPRE") ? atoi(getenv("CHPL2D_PKGPRE")) : 0;
     const int presel = getenv("CHPL2D_PRESEL") ? atoi(getenv("CHPL2D_PRESEL")) : 0;
     const int g_psync = getenv("CHPL2D_PSYNC") ? atoi(getenv("CHPL2D_PSYNC")) : 0;
     std::vector<std::array<cudaEvent_t, 4>> evReadyU(npan + 1), evUpdC(npan + 1);
@@ -1264,11 +978,8 @@ int main(int argc, char **argv)
         CHECK_CUDA(cudaEventCreateWithFlags(&evUpd[i], cudaEventDisableTiming));
         CHECK_CUDA(cudaEventCreateWithFlags(&evXg0[i], cudaEventDisableTiming));
         CHECK_CUDA(cudaEventCreateWithFlags(&evD2s[i], cudaEventDisableTiming));
-        CHECK_CUDA(cudaEventCreateWithFlags(&evPkgS[i], cudaEventDisableTiming));
-        CHECK_CUDA(cudaEventCreateWithFlags(&evPkg[i], cudaEventDisableTiming));
         CHECK_CUDA(cudaEventCreateWithFlags(&evSel[i], cudaEventDisableTiming));
         CHECK_CUDA(cudaEventCreateWithFlags(&evCand[i], cudaEventDisableTiming));
-        CHECK_CUDA(cudaEventCreateWithFlags(&evSel2[i], cudaEventDisableTiming));
         for (int c = 0; c < 8; c++)
             CHECK_CUDA(cudaEventCreateWithFlags(&evWc[i][c],
                                                 cudaEventDisableTiming));
@@ -1335,8 +1046,8 @@ int main(int argc, char **argv)
     /* panel chain part A: tournament factorization of panel k (on sP).
      * Host-synchronous pivot bookkeeping is fine: the trailing update of
      * iteration k-1 is already queued on s0 and keeps the GPU busy. */
-    long long mlocP[4];
-    for (int p_ = 0; p_ < P; p_++) mlocP[p_] = lrows_below(N, NB, p_, N);
+    const long long mloc0 = lrows_below(N, NB, 0, N);
+    const long long mloc1 = lrows_below(N, NB, 1, N);
     auto chainA = [&](int k) {
         const long long gr0 = (long long)k * NB;
         const int jb = (int)std::min((long long)NB, (long long)N - gr0);
@@ -1349,28 +1060,12 @@ int main(int argc, char **argv)
         if (k >= 2) CHECK_CUDA(cudaStreamWaitEvent(sP, evUpdC[k - 2][3], 0));
         rec2(tSP, k, 0, sP);
         /* candidate counts are geometric: no communication needed */
-        int nck[4], pre[5]; pre[0] = 0;
-        for (int p_ = 0; p_ < P; p_++) {
-            nck[p_] = (int)std::max(0LL, std::min((long long)jb,
-                          mlocP[p_] - lrows_below(gr0, NB, p_, N)));
-            pre[p_ + 1] = pre[p_] + nck[p_];
-        }
-        const int myncand = nck[pr];
-        const int p2fast = (presel2 && k >= 1);  /* stage-2 preselected */
-        if (p2fast && qc == kq) {
-            /* the full tournament already ran on sSel during chainB(k-1);
-             * pull winners + inv pieces into canonical, skip everything */
-            CHECK_CUDA(cudaStreamWaitEvent(sP, evSel2[k], 0));
-            if (pr == 0) {
-                const int bb = k & 1;
-                CHECK_CUDA(cudaMemcpyAsync(d_win, d_win2[bb], (size_t)jb * 4,
-                                           cudaMemcpyDeviceToDevice, sP));
-                CHECK_CUDA(cudaMemcpyAsync(d_pkg[bb], d_pkgP[bb],
-                                           (size_t)3 * NB * NB * 8,
-                                           cudaMemcpyDeviceToDevice, sP));
-            }
-        }
-        if (!p2fast && qc == kq && myncand > 0) {
+        const int nc0 = (int)std::max(0LL, std::min((long long)jb,
+                            mloc0 - lrows_below(gr0, NB, 0, N)));
+        const int nc1 = (int)std::max(0LL, std::min((long long)jb,
+                            mloc1 - lrows_below(gr0, NB, 1, N)));
+        const int myncand = pr == 0 ? nc0 : nc1;
+        if (qc == kq && myncand > 0) {
             /* bisect modes 6-8: preselect ran partially; use inline results
              * (wait evSel first so the sSel getrf isn't mid-flight on d_Wf) */
             if (presel && k >= 1 && g_psync >= 6)
@@ -1396,7 +1091,7 @@ int main(int argc, char **argv)
                                                   d_occ, d_top);
                 prep_cand_kernel<<<(myncand + 255) / 256, 256, 0, sP>>>(
                     d_top, myncand, plr0, d_grow, d_rows + 6 * NB,
-                    d_provA + pr * NB);
+                    pr == 0 ? d_prov0 : d_prov1);
             } else {
                 /* selection ran one panel early on sSel (stale by one
                  * urgent update + exchange); values gathered fresh below */
@@ -1404,8 +1099,8 @@ int main(int argc, char **argv)
                 CHECK_CUDA(cudaMemcpyAsync(d_rows + 6 * NB, d_rows2,
                                            (size_t)myncand * 4,
                                            cudaMemcpyDeviceToDevice, sP));
-                CHECK_CUDA(cudaMemcpyAsync(d_provA + pr * NB, d_provP,
-                                           (size_t)myncand * 4,
+                CHECK_CUDA(cudaMemcpyAsync(pr == 0 ? d_prov0 : d_prov1,
+                                           d_provP, (size_t)myncand * 4,
                                            cudaMemcpyDeviceToDevice, sP));
                 static const int psync4 =
                     getenv("CHPL2D_PSYNC") ? atoi(getenv("CHPL2D_PSYNC")) : 0;
@@ -1424,7 +1119,7 @@ int main(int argc, char **argv)
                                                       (int)mlk, d_occ, d_top);
                     prep_cand_kernel<<<(myncand + 255) / 256, 256, 0, sP>>>(
                         d_top, myncand, plr0, d_grow, d_rows + 6 * NB,
-                        d_provA + pr * NB);
+                        pr == 0 ? d_prov0 : d_prov1);
                 }
                 static const int pdump3a =
                     getenv("CHPL2D_PDUMP") ? atoi(getenv("CHPL2D_PDUMP")) : 0;
@@ -1461,54 +1156,48 @@ int main(int argc, char **argv)
             dim3 blk(32, 8), grd((myncand + 31) / 32, (unsigned)((jb + 7) / 8));
             grow_gather_kernel<<<grd, blk, 0, sP>>>(
                 d_A, lda, d_rows + 6 * NB, myncand, (size_t)pc0, jb,
-                d_cand + (size_t)pr * NB * NB);
+                d_cand + (pr ? (size_t)NB * NB : 0));
         }
         rec2(tSP, k, 1, sP);
         const int b = k & 1;
-        if (!p2fast && qc == kq) {
+        if (qc == kq && nc1 > 0) {
             CHECK_NCCL(ncclGroupStart());
-            if (pr == 0) {
-                for (int p_ = 1; p_ < P; p_++) if (nck[p_] > 0) {
-                    CHECK_NCCL(ncclRecv(d_cand + (size_t)p_ * NB * NB,
-                                        (size_t)nck[p_] * jb, ncclDouble, p_,
-                                        ncol, sP));
-                    CHECK_NCCL(ncclRecv(d_provA + p_ * NB, nck[p_],
-                                        ncclInt32, p_, ncol, sP));
-                }
-            } else if (myncand > 0) {
-                CHECK_NCCL(ncclSend(d_cand + (size_t)pr * NB * NB,
-                                    (size_t)myncand * jb, ncclDouble, 0,
-                                    ncol, sP));
-                CHECK_NCCL(ncclSend(d_provA + pr * NB, myncand, ncclInt32,
-                                    0, ncol, sP));
+            if (pr == 1) {
+                CHECK_NCCL(ncclSend(d_cand + (size_t)NB * NB, (size_t)nc1 * jb,
+                                    ncclDouble, 0, ncol, sP));
+                CHECK_NCCL(ncclSend(d_prov1, nc1, ncclInt32, 0, ncol, sP));
+            } else {
+                CHECK_NCCL(ncclRecv(d_cand + (size_t)NB * NB, (size_t)nc1 * jb,
+                                    ncclDouble, 1, ncol, sP));
+                CHECK_NCCL(ncclRecv(d_prov1, nc1, ncclInt32, 1, ncol, sP));
             }
             CHECK_NCCL(ncclGroupEnd());
         }
         rec2(tSP, k, 2, sP);
-        if (!p2fast && qc == kq && pr == 0) {
-            int nst = pre[P];
+        if (qc == kq && pr == 0) {
+            int nst = nc0 + nc1;
             /* fp32 stacked getrf selects the winners; the diagonal block is
              * then re-gathered from the fp64 originals and factored square
              * in fp64 (its internal pivoting is composed into the winner
              * order) */
             {
                 dim3 gg(64, jb);
-                for (int p_ = 0; p_ < P; p_++)
-                    if (nck[p_] > 0)
-                        d2s_kernel<<<gg, 256, 0, sP>>>(
-                            d_cand + (size_t)p_ * NB * NB, (size_t)nck[p_],
-                            d_sel + pre[p_], (size_t)nst, nck[p_], jb);
+                d2s_kernel<<<gg, 256, 0, sP>>>(d_cand, (size_t)nc0, d_sel,
+                                               (size_t)nst, nc0, jb);
+                if (nc1 > 0)
+                    d2s_kernel<<<gg, 256, 0, sP>>>(d_cand + (size_t)NB * NB,
+                                                   (size_t)nc1, d_sel + nc0,
+                                                   (size_t)nst, nc1, jb);
             }
             CHECK_CUSOLVER(cusolverDnSgetrf(cs, nst, jb, d_sel, nst,
                                             (float *)d_work, d_ipiv, d_info));
             resolve_kernel<<<1, 256, 0, sP>>>(d_ipiv, jb, nst, d_occ, d_top);
-            winmap4_kernel<<<(jb + 255) / 256, 256, 0, sP>>>(
-                d_top, jb, pre[1], pre[2], pre[3], d_provA, NB,
-                d_rows + 9 * NB);
+            winmap_kernel<<<(jb + 255) / 256, 256, 0, sP>>>(
+                d_top, jb, nc0, d_prov0, d_prov1, d_rows + 9 * NB);
             {
                 dim3 blk(32, 8), grd((jb + 31) / 32, 64);
-                win_gather4_kernel<<<grd, blk, 0, sP>>>(
-                    d_top, jb, pre[1], pre[2], pre[3], pre[4], d_cand, NB,
+                win_gather_kernel<<<grd, blk, 0, sP>>>(
+                    d_top, jb, nc0, nc1, d_cand, d_cand + (size_t)NB * NB,
                     d_pkg[b]);
             }
             CHECK_CUSOLVER(cusolverDnDgetrf(cs, jb, jb, d_pkg[b], jb, d_work,
@@ -1529,32 +1218,12 @@ int main(int argc, char **argv)
                                      CUBLAS_OP_N, CUBLAS_DIAG_NON_UNIT, jb, jb,
                                      &done_, d_pkg[b], jb,
                                      d_pkg[b] + (size_t)2 * jb * jb, jb));
-            /* probe: artificial delay INSIDE stage-2 (pr==0) to measure how
-             * much of the final selection is exposed on the critical path */
-            static const long long dly2_us =
-                getenv("CHPL2D_DLY2") ? atoll(getenv("CHPL2D_DLY2")) : 0;
-            if (dly2_us > 0)
-                spin_kernel<<<1, 1, 0, sP>>>(dly2_us * 1980);
         }
         /* all consumers of d_rows+6NB / d_prov (grow_gather, prov send,
          * winmap) are behind this point: safe for the next preselect */
         CHECK_CUDA(cudaEventRecord(evCand[k], sP));
         rec2(tSP, k, 3, sP);
-        if (pkgpre) {
-            /* prefetch the inv(L11)/inv(U11) pieces on a dedicated comm and
-             * stream: overlaps chainB's exch g0 + W section instead of
-             * sitting on the sP chain.  evPkgS (sP) implies the owner's
-             * trsms are done AND every rank's emit(k-2) pkg reads are done
-             * (sP-serial). */
-            CHECK_CUDA(cudaEventRecord(evPkgS[k], sP));
-            CHECK_CUDA(cudaStreamWaitEvent(sK, evPkgS[k], 0));
-            CHECK_NCCL(ncclBroadcast(d_pkg[b] + (size_t)jb * jb,
-                                     d_pkg[b] + (size_t)jb * jb,
-                                     (size_t)2 * jb * jb, ncclDouble, P * kq,
-                                     nworld2, sK));
-            CHECK_CUDA(cudaEventRecord(evPkg[k], sK));
-        }
-        CHECK_NCCL(ncclBroadcast(d_win, d_win, jb, ncclInt32, P * kq, nworld,
+        CHECK_NCCL(ncclBroadcast(d_win, d_win, jb, ncclInt32, 2 * kq, nworld,
                                  sP));
         rec2(tSP, k, 4, sP);
         static const int pdump2 =
@@ -1587,19 +1256,12 @@ int main(int argc, char **argv)
         const long long plr0 = lrows_below(gr0, NB, pr, N);
         const long long mlk = mloc - plr0;
         const long long pc0 = lcols_below(gr0, NB, qc, ntot);
-        int nck[4], pre[5]; pre[0] = 0;
-        for (int p_ = 0; p_ < P; p_++) {
-            nck[p_] = (int)std::max(0LL, std::min((long long)jb,
-                          mlocP[p_] - lrows_below(gr0, NB, p_, N)));
-            pre[p_ + 1] = pre[p_] + nck[p_];
-        }
-        const int myncand = nck[pr];
-        /* presel2: owner-column ranks with 0 candidates must STILL reach the
-         * ncol exchange below (else the collective mismatches -> deadlock);
-         * only their stage-1 selection is skipped. */
-        if (qc != kq) return;
-        if (!presel2 && myncand <= 0) return;
-        if (myncand > 0) {
+        const int nc0 = (int)std::max(0LL, std::min((long long)jb,
+                            mloc0 - lrows_below(gr0, NB, 0, N)));
+        const int nc1 = (int)std::max(0LL, std::min((long long)jb,
+                            mloc1 - lrows_below(gr0, NB, 1, N)));
+        const int myncand = pr == 0 ? nc0 : nc1;
+        if (qc != kq || myncand <= 0) return;
         {
             dim3 gg(128, jb);
             d2s_kernel<<<gg, 256, 0, sP>>>(d_A + pc0 * lda + plr0, lda,
@@ -1632,90 +1294,6 @@ int main(int argc, char **argv)
         prep_cand_kernel<<<(myncand + 255) / 256, 256, 0, sSel>>>(
             d_top2, myncand, plr0, d_grow, d_rows2, d_provP);
         CHECK_CUDA(cudaEventRecord(evSel[k], sSel));
-        }  /* end if (myncand > 0) : stage-1 selection */
-
-        if (!presel2) return;
-        /* ---- stage-2 preselect: full tournament on sSel, off the sP chain.
-         * All P owner-column ranks reach here together (same chainB(k-1)
-         * point), so the ncol collective matches up; ncol is otherwise idle
-         * during chainB.  Results land in private buffers, copied to the
-         * canonical d_win/d_pkg by chainA(k). ---- */
-        const int b2 = k & 1;
-        /* gather this rank's fp64 winner rows (from panel k cols, final at
-         * g==1) into its cand slot */
-        if (myncand > 0) {
-            dim3 blk(32, 8),
-                grd((myncand + 31) / 32, (unsigned)((jb + 7) / 8));
-            grow_gather_kernel<<<grd, blk, 0, sSel>>>(
-                d_A, lda, d_rows2, myncand, (size_t)pc0, jb,
-                d_candP + (size_t)pr * NB * NB);
-        }
-        /* candidate exchange over ncol into pr==0's private cand/prov */
-        CHECK_NCCL(ncclGroupStart());
-        if (pr == 0) {
-            for (int p_ = 1; p_ < P; p_++) if (nck[p_] > 0) {
-                CHECK_NCCL(ncclRecv(d_candP + (size_t)p_ * NB * NB,
-                                    (size_t)nck[p_] * jb, ncclDouble, p_,
-                                    ncol, sSel));
-                CHECK_NCCL(ncclRecv(d_provAP + p_ * NB, nck[p_], ncclInt32,
-                                    p_, ncol, sSel));
-            }
-        } else if (myncand > 0) {
-            CHECK_NCCL(ncclSend(d_candP + (size_t)pr * NB * NB,
-                                (size_t)myncand * jb, ncclDouble, 0, ncol,
-                                sSel));
-            CHECK_NCCL(ncclSend(d_provP, myncand, ncclInt32, 0, ncol, sSel));
-        }
-        CHECK_NCCL(ncclGroupEnd());
-        /* pr==0's own provenance into slot 0 */
-        if (pr == 0)
-            CHECK_CUDA(cudaMemcpyAsync(d_provAP, d_provP,
-                                       (size_t)myncand * 4,
-                                       cudaMemcpyDeviceToDevice, sSel));
-        if (pr == 0 && pre[P] > 0) {
-            int nst = pre[P];
-            {
-                dim3 gg(64, jb);
-                for (int p_ = 0; p_ < P; p_++)
-                    if (nck[p_] > 0)
-                        d2s_kernel<<<gg, 256, 0, sSel>>>(
-                            d_candP + (size_t)p_ * NB * NB, (size_t)nck[p_],
-                            d_selP + pre[p_], (size_t)nst, nck[p_], jb);
-            }
-            CHECK_CUSOLVER(cusolverDnSgetrf(cs3, nst, jb, d_selP, nst,
-                                            d_work2, d_ipiv2, d_info2));
-            resolve_kernel<<<1, 256, 0, sSel>>>(d_ipiv2, jb, nst, d_occ2,
-                                                d_top3);
-            winmap4_kernel<<<(jb + 255) / 256, 256, 0, sSel>>>(
-                d_top3, jb, pre[1], pre[2], pre[3], d_provAP, NB, d_rows9P);
-            {
-                dim3 blk(32, 8), grd((jb + 31) / 32, 64);
-                win_gather4_kernel<<<grd, blk, 0, sSel>>>(
-                    d_top3, jb, pre[1], pre[2], pre[3], pre[4], d_candP, NB,
-                    d_pkgP[b2]);
-            }
-            CHECK_CUSOLVER(cusolverDnDgetrf(cs3, jb, jb, d_pkgP[b2], jb,
-                                            d_work3, d_ipiv2, d_info2));
-            resolve_kernel<<<1, 256, 0, sSel>>>(d_ipiv2, jb, jb, d_occ2,
-                                                d_top3 + NB);
-            compose_win_kernel<<<(jb + 255) / 256, 256, 0, sSel>>>(
-                d_top3 + NB, d_rows9P, jb, d_win2[b2]);
-            seteye_kernel<<<(jb * jb + 255) / 256, 256, 0, sSel>>>(
-                d_pkgP[b2] + (size_t)jb * jb, jb);
-            CHECK_CUBLAS(cublasDtrsm(hb3, CUBLAS_SIDE_LEFT,
-                                     CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N,
-                                     CUBLAS_DIAG_UNIT, jb, jb, &done_,
-                                     d_pkgP[b2], jb,
-                                     d_pkgP[b2] + (size_t)jb * jb, jb));
-            seteye_kernel<<<(jb * jb + 255) / 256, 256, 0, sSel>>>(
-                d_pkgP[b2] + (size_t)2 * jb * jb, jb);
-            CHECK_CUBLAS(cublasDtrsm(hb3, CUBLAS_SIDE_LEFT,
-                                     CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_N,
-                                     CUBLAS_DIAG_NON_UNIT, jb, jb, &done_,
-                                     d_pkgP[b2], jb,
-                                     d_pkgP[b2] + (size_t)2 * jb * jb, jb));
-        }
-        CHECK_CUDA(cudaEventRecord(evSel2[k], sSel));
     };
 
     /* panel chain part B: row exchange, diagonal write-back, L21 + row
@@ -1733,15 +1311,12 @@ int main(int argc, char **argv)
 
         /* net permutation + exchange lists, built on device from d_win */
         buildlists_kernel<<<1, 256, 40 * NB + 1024, sP>>>(d_win, gr0, jb, NB,
-                                                          P, pr, d_rows,
-                                                          d_cnt);
+                                                          pr, d_rows, d_cnt);
 
         /* one exchange pass over a local column range (row counts live on the
          * device; grids are worst-case-sized, NCCL messages fixed at NB rows) */
         auto exch_range = [&](long long c0a, long long nca) {
-            /* star topology: all inter-rank rows route through the diag-
-             * owner row kp.  xpack regions: [sslot][dst_pr] (2P of NB*XT),
-             * then a 2NB*XT local staging region. */
+            const int xpartner = (1 - pr) + 2 * qc;
             for (long long t0 = 0; t0 < nca; t0 += XT) {
                 long long c0 = c0a + t0, nc = std::min(XT, nca - t0);
                 exch_seq++;
@@ -1749,52 +1324,32 @@ int main(int argc, char **argv)
                 dim3 blk(32, 8);
                 unsigned gy = (unsigned)std::min((nc + 7) / 8, (long long)64);
                 dim3 g2NB((2 * NB + 31) / 32, gy), g1NB((NB + 31) / 32, gy);
-                /* readers of my previous same-parity slot must be done */
-                if (exch_seq > 2) {
-                    if (pr == kp) {
-                        flag_wait_kernel<<<1, 1, 0, sP>>>(
-                            peer[P * qc + ((pr + 1) % P)].flags + 7,
-                            peer[P * qc + ((pr + 2) % P)].flags + 7,
-                            peer[P * qc + ((pr + 3) % P)].flags + 7,
-                            exch_seq - 2);
-                    } else {
-                        flag_wait_kernel<<<1, 1, 0, sP>>>(
-                            peer[kp + P * qc].flags + 7, nullptr, nullptr,
-                            exch_seq - 2);
-                    }
-                }
-                /* pack outgoing rows per destination */
-                for (int p_ = 0; p_ < P; p_++) {
-                    if (p_ == pr || (pr != kp && p_ != kp)) continue;
-                    gather_dyn_kernel<<<g1NB, blk, 0, sP>>>(
-                        d_A, lda, d_rows + (4 + p_) * NB, d_cnt, 1 + p_,
-                        (size_t)c0, nc,
-                        d_xpack + ((size_t)sslot * P + p_) * NB * XT,
-                        (size_t)NB);
-                }
+                /* partner must have consumed my previous same-parity tile */
+                if (exch_seq > 2)
+                    flag_wait_kernel<<<1, 1, 0, sP>>>(
+                        peer[xpartner].flags + 7, nullptr, nullptr,
+                        exch_seq - 2);
+                /* pack rows leaving this rank into my send slot */
+                gather_dyn_kernel<<<g1NB, blk, 0, sP>>>(
+                    d_A, lda, d_rows + 2 * NB, d_cnt, 1, (size_t)c0, nc,
+                    d_xpack + (size_t)sslot * NB * XT, (size_t)NB);
                 /* local moves staged before any scatter */
                 gather_dyn_kernel<<<g2NB, blk, 0, sP>>>(
-                    d_A, lda, d_rows, d_cnt, 0, (size_t)c0, nc,
-                    d_xpack + (size_t)2 * P * NB * XT, (size_t)2 * NB);
+                    d_A, lda, d_rows + 3 * NB, d_cnt, 2, (size_t)c0, nc,
+                    d_xpack + (size_t)2 * NB * XT, (size_t)2 * NB);
                 flag_set_kernel<<<1, 1, 0, sP>>>(d_flags + 6, exch_seq);
+                /* partner's rows: scatter DIRECTLY from its send slot */
+                flag_wait_kernel<<<1, 1, 0, sP>>>(peer[xpartner].flags + 6,
+                                                  nullptr, nullptr, exch_seq);
                 scatter_dyn_kernel<<<g2NB, blk, 0, sP>>>(
-                    d_A, lda, d_rows + 2 * NB, d_cnt, 0, (size_t)c0, nc,
-                    d_xpack + (size_t)2 * P * NB * XT, (size_t)2 * NB);
-                /* pull peers' rows directly from their send slots */
-                for (int p_ = 0; p_ < P; p_++) {
-                    if (p_ == pr || (pr != kp && p_ != kp)) continue;
-                    const int prank = p_ + P * qc;
-                    flag_wait_kernel<<<1, 1, 0, sP>>>(
-                        peer[prank].flags + 6, nullptr, nullptr, exch_seq);
-                    scatter_dyn_kernel<<<g1NB, blk, 0, sP>>>(
-                        d_A, lda, d_rows + (8 + p_) * NB, d_cnt, 1 + P + p_,
-                        (size_t)c0, nc,
-                        peer[prank].xp + ((size_t)sslot * P + pr) * NB * XT,
-                        (size_t)NB);
-                }
+                    d_A, lda, d_rows + 5 * NB, d_cnt, 2, (size_t)c0, nc,
+                    d_xpack + (size_t)2 * NB * XT, (size_t)2 * NB);
+                scatter_dyn_kernel<<<g1NB, blk, 0, sP>>>(
+                    d_A, lda, d_rows + 7 * NB, d_cnt, 3, (size_t)c0, nc,
+                    peer[xpartner].xp + (size_t)sslot * NB * XT, (size_t)NB);
                 flag_set_kernel<<<1, 1, 0, sP>>>(d_flags + 7, exch_seq);
             }
-                };        long long prng[4][2] = {{0, 0}, {0, 0}, {0, 0}, {0, 0}};
+        };        long long prng[4][2] = {{0, 0}, {0, 0}, {0, 0}, {0, 0}};
         long long ptc0 = 0;
         if (k > 0) { chunks_of(k - 1, prng); ptc0 = prng[0][0]; }
         else { prng[0][0] = 0; prng[0][1] = nloc;
@@ -1833,13 +1388,12 @@ int main(int argc, char **argv)
                         flag_set_kernel<<<1, 1, 0, sP>>>(
                             d_flags + 2, (long long)k * 4 + cnext + 1);
                     } else {
-                        const int uroot = kp + P * qc;
                         flag_wait_kernel<<<1, 1, 0, sP>>>(
-                            peer[uroot].flags + 2, nullptr, nullptr,
+                            peer[upartner].flags + 2, nullptr, nullptr,
                             (long long)k * 4 + cnext + 1);
                         CHECK_CUDA(cudaMemcpyAsync(
                             d_U[b] + (size_t)(c0 - tc0) * jb,
-                            peer[uroot].U[b] + (size_t)(c0 - tc0) * jb,
+                            peer[upartner].U[b] + (size_t)(c0 - tc0) * jb,
                             (size_t)jb * nc * 8, cudaMemcpyDeviceToDevice,
                             sP));
                     }
@@ -1873,26 +1427,6 @@ int main(int argc, char **argv)
                                         d_W[b], (int)mlb, d_Mt, jb, &done_,
                                         d_A + (c0 + t0) * lda + blr0,
                                         (int)lda));
-                                } else if (wi8) {
-                                    /* row-chunk transport: m-split gemms */
-                                    const long long rch =
-                                        (mlb + WCH - 1) / WCH;
-                                    for (int cw = 0; cw < WCH; cw++) {
-                                        const long long r0 = cw * rch;
-                                        const long long rn =
-                                            std::min(rch, mlb - r0);
-                                        if (rn <= 0) break;
-                                        CHECK_CUDA(cudaStreamWaitEvent(
-                                            sP, evWc[k][cw], 0));
-                                        CHECK_CUBLAS(cublasDgemm(
-                                            hbP, CUBLAS_OP_N, CUBLAS_OP_N,
-                                            (int)rn, (int)nt2, jb, &dmone,
-                                            d_W[b] + r0, (int)mlb, d_Mt, jb,
-                                            &done_,
-                                            d_A + (c0 + t0) * lda + blr0 +
-                                                r0,
-                                            (int)lda));
-                                    }
                                 } else {
                                     /* K-slab per W chunk (accumulating gemm
                                      * splits over K); wait each chunk */
@@ -1929,43 +1463,6 @@ int main(int argc, char **argv)
                                     (int)nc, jb, &dmone, d_W[b], (int)mlb,
                                     d_Mfb + (size_t)b * NB * NB, jb, &done_,
                                     d_A + c0 * lda + blr0, (int)lda));
-                            } else if (wi8) {
-                                const long long rch = (mlb + WCH - 1) / WCH;
-                                for (int cw = 0; cw < WCH; cw++) {
-                                    const long long r0 = cw * rch;
-                                    const long long rn =
-                                        std::min(rch, mlb - r0);
-                                    if (rn <= 0) break;
-                                    CHECK_CUDA(cudaStreamWaitEvent(
-                                        sP, evWc[k][cw], 0));
-                                    CHECK_CUBLAS(cublasDgemm(
-                                        hbP, CUBLAS_OP_N, CUBLAS_OP_N,
-                                        (int)rn, (int)nc, jb, &dmone,
-                                        d_W[b] + r0, (int)mlb,
-                                        d_Mfb + (size_t)b * NB * NB, jb,
-                                        &done_, d_A + c0 * lda + blr0 + r0,
-                                        (int)lda));
-                                }
-                            } else if (g8_msplit) {
-                                /* row-packed W: chunk cw is a dense rn x jb
-                                 * block at d_W + r0*jb (lda = rn) */
-                                const long long rchw = (mlb + WCH - 1) / WCH;
-                                for (int cw = 0; cw < WCH; cw++) {
-                                    const long long r0 = (long long)cw * rchw;
-                                    const long long rn =
-                                        std::min(rchw, mlb - r0);
-                                    if (rn <= 0) break;
-                                    CHECK_CUDA(cudaStreamWaitEvent(
-                                        sP, evWc[k][cw], 0));
-                                    CHECK_CUBLAS(cublasDgemm(
-                                        hbP, CUBLAS_OP_N, CUBLAS_OP_N,
-                                        (int)rn, (int)nc, jb, &dmone,
-                                        d_W[b] + (size_t)r0 * jb, (int)rn,
-                                        d_Mfb + (size_t)b * NB * NB, jb,
-                                        &done_,
-                                        d_A + c0 * lda + blr0 + r0,
-                                        (int)lda));
-                                }
                             } else {
                                 const int jcw = (jb + WCH - 1) / WCH;
                                 for (int cw = 0; cw < WCH; cw++) {
@@ -2026,7 +1523,7 @@ int main(int argc, char **argv)
                 flag_set_kernel<<<1, 1, 0, sP>>>(d_flags + 0,
                                                  (long long)k + 1);
             } else {
-                const int wroot = pr + P * kq;
+                const int wroot = pr + 2 * kq;
                 flag_wait_kernel<<<1, 1, 0, sP>>>(peer[wroot].flags + 0,
                                                   nullptr, nullptr,
                                                   (long long)k + 1);
@@ -2038,110 +1535,6 @@ int main(int argc, char **argv)
             }
             flag_set_kernel<<<1, 1, 0, sP>>>(d_flags + 1, (long long)k + 1);
             CHECK_CUDA(cudaEventRecord(evReadyW[k], sP));
-        } else if (wi8v2) {
-            /* WI8v2: ONE ncclBroadcast per row-chunk (digits+scale packed
-             * into a wire row) instead of TWO (payload + separate scale
-             * array).  Root additionally tight-slices straight into ozSAt
-             * (exact, same as v1); non-root unpacks the wire into ozSAt
-             * (tight, for the digit GEMMs) and reconstructs d_W in one
-             * pass.  This halves the per-chunk NCCL call count, which is
-             * what made plain WI8 (v1) get WORSE as node count grew (nrow
-             * spans more physical nodes -> more per-call network hops). */
-            CHECK_CUDA(cudaEventRecord(evXg0[k], sP));
-            CHECK_CUDA(cudaStreamWaitEvent(sW, evXg0[k], 0));
-            if (k >= 2)
-                CHECK_CUDA(cudaStreamWaitEvent(sW, evUpdC[k - 2][3], 0));
-            const size_t ldSw = (size_t)OZ_S * jb;
-            const size_t scOffJ = ((ldSw + 7) / 8) * 8;
-            const size_t ldWireJ = scOffJ + 8;
-            const long long rch = (mlb + WCH - 1) / WCH;
-            for (int cw = 0; cw < WCH; cw++) {
-                const long long r0 = cw * rch;
-                const long long rn = std::min(rch, mlb - r0);
-                if (rn <= 0) break;
-                if (qc == kq) {
-                    CHECK_CUDA(cudaMemcpy2DAsync(
-                        d_W[b] + r0, mlb * 8,
-                        d_A + pc0 * lda + blr0 + r0, lda * 8, rn * 8, jb,
-                        cudaMemcpyDeviceToDevice, sW));
-                    ozrowscale_kernel<<<(unsigned)((rn + 255) / 256), 256, 0,
-                                        sW>>>(d_W[b] + r0, (size_t)mlb,
-                                              (int)rn, jb, ozRinv + r0,
-                                              ozRs2[b] + r0);
-                    dim3 sblk(32, 8), sgrd((unsigned)((rn + 31) / 32),
-                                           (unsigned)((jb + 31) / 32));
-                    ozsliceA_kernel<<<sgrd, sblk, 0, sW>>>(
-                        d_W[b] + r0, (size_t)mlb, (int)rn, jb, ozRinv + r0,
-                        ozSAt[b] + (size_t)r0 * ldSw, OZ_S);
-                    /* cheap: copy the digits ozsliceA_kernel just computed
-                     * (no re-derivation from d_W) into the padded wire row,
-                     * appending the already-computed scale */
-                    dim3 rpblk(32, 8), rpgrd((unsigned)((rn + 31) / 32), 32);
-                    oz_wire_repack_kernel<<<rpgrd, rpblk, 0, sW>>>(
-                        ozSAt[b] + (size_t)r0 * ldSw, ldSw, (int)rn, jb,
-                        ozRs2[b] + r0, ozWireAt[b], ldWireJ, OZ_S, scOffJ);
-                }
-                CHECK_NCCL(ncclBroadcast(ozWireAt[b], ozWireAt[b],
-                                         (size_t)rn * ldWireJ, ncclInt8, kq,
-                                         nrow, sW));
-                if (qc != kq) {
-                    dim3 rblk(32, 8), rgrd((unsigned)((rn + 31) / 32), 32);
-                    oz_wire_unpack_kernel<<<rgrd, rblk, 0, sW>>>(
-                        ozWireAt[b], ldWireJ, (int)rn, jb, d_W[b] + r0,
-                        (size_t)mlb, ozSAt[b] + (size_t)r0 * ldSw, ldSw,
-                        OZ_S, scOffJ, ozRs2[b] + r0);
-                }
-                CHECK_CUDA(cudaEventRecord(evWc[k][cw], sW));
-            }
-            CHECK_CUDA(cudaEventRecord(evReadyW[k], sW));
-        } else if (wi8) {
-            /* int8 slice transport: root scales+slices W row-chunks on sW
-             * and broadcasts slices + row scales (75% of the fp64 bytes);
-             * receivers feed the digit gemms from the slice buffer directly
-             * and rebuild a 42-bit fp64 W for the urgent/fallback gemms. */
-            CHECK_CUDA(cudaEventRecord(evXg0[k], sP));
-            CHECK_CUDA(cudaStreamWaitEvent(sW, evXg0[k], 0));
-            if (k >= 2)
-                CHECK_CUDA(cudaStreamWaitEvent(sW, evUpdC[k - 2][3], 0));
-            const size_t ldSw = (size_t)OZ_S * jb;
-            const long long rch = (mlb + WCH - 1) / WCH;
-            for (int cw = 0; cw < WCH; cw++) {
-                const long long r0 = cw * rch;
-                const long long rn = std::min(rch, mlb - r0);
-                if (rn <= 0) break;
-                if (qc == kq) {
-                    CHECK_CUDA(cudaMemcpy2DAsync(
-                        d_W[b] + r0, mlb * 8,
-                        d_A + pc0 * lda + blr0 + r0, lda * 8, rn * 8, jb,
-                        cudaMemcpyDeviceToDevice, sW));
-                    ozrowscale_kernel<<<(unsigned)((rn + 255) / 256), 256, 0,
-                                        sW>>>(d_W[b] + r0, (size_t)mlb,
-                                              (int)rn, jb, ozRinv + r0,
-                                              ozRs2[b] + r0);
-                    dim3 sblk(32, 8), sgrd((unsigned)((rn + 31) / 32),
-                                           (unsigned)((jb + 31) / 32));
-                    ozsliceA_kernel<<<sgrd, sblk, 0, sW>>>(
-                        d_W[b] + r0, (size_t)mlb, (int)rn, jb, ozRinv + r0,
-                        ozSAt[b] + (size_t)r0 * ldSw, OZ_S);
-                }
-                CHECK_NCCL(ncclGroupStart());
-                CHECK_NCCL(ncclBroadcast(ozSAt[b] + (size_t)r0 * ldSw,
-                                         ozSAt[b] + (size_t)r0 * ldSw,
-                                         (size_t)rn * ldSw, ncclInt8, kq,
-                                         nrow, sW));
-                CHECK_NCCL(ncclBroadcast(ozRs2[b] + r0, ozRs2[b] + r0,
-                                         (size_t)rn, ncclDouble, kq, nrow,
-                                         sW));
-                CHECK_NCCL(ncclGroupEnd());
-                if (qc != kq) {
-                    dim3 rblk(32, 8), rgrd((unsigned)((rn + 31) / 32), 32);
-                    ozrecW_kernel<<<rgrd, rblk, 0, sW>>>(
-                        ozSAt[b] + (size_t)r0 * ldSw, ldSw, (int)rn, jb,
-                        ozRs2[b] + r0, d_W[b] + r0, (size_t)mlb, OZ_S);
-                }
-                CHECK_CUDA(cudaEventRecord(evWc[k][cw], sW));
-            }
-            CHECK_CUDA(cudaEventRecord(evReadyW[k], sW));
         } else {
             /* multi-node: W broadcast over the nrow communicator (NCCL) on
              * its own stream, pipelined in column chunks; the urgent-chunk
@@ -2152,31 +1545,6 @@ int main(int argc, char **argv)
             CHECK_CUDA(cudaStreamWaitEvent(sW, evXg0[k], 0));
             if (k >= 2)
                 CHECK_CUDA(cudaStreamWaitEvent(sW, evUpdC[k - 2][3], 0));
-            if (g8_msplit) {
-                /* ROW chunks, each repacked to a dense rn x jb block at
-                 * d_W + r0*jb (root's staging memcpy2D does the repack for
-                 * free -- same bytes as the column-chunk copy).  Consumers
-                 * (s0 G8 m-split, urgent row-split, fp64 fallback) read
-                 * blocks with lda = rn, so the first chunk is usable as
-                 * soon as its broadcast lands -- s0 no longer waits for
-                 * the whole W. */
-                const long long rchw = (mlb + WCH - 1) / WCH;
-                for (int cw = 0; cw < WCH; cw++) {
-                    const long long r0 = (long long)cw * rchw;
-                    const long long rn = std::min(rchw, mlb - r0);
-                    if (rn <= 0) break;
-                    if (qc == kq)
-                        CHECK_CUDA(cudaMemcpy2DAsync(
-                            d_W[b] + (size_t)r0 * jb, rn * 8,
-                            d_A + pc0 * lda + blr0 + r0, lda * 8, rn * 8,
-                            jb, cudaMemcpyDeviceToDevice, sW));
-                    CHECK_NCCL(ncclBroadcast(d_W[b] + (size_t)r0 * jb,
-                                             d_W[b] + (size_t)r0 * jb,
-                                             (size_t)rn * jb, ncclDouble,
-                                             kq, nrow, sW));
-                    CHECK_CUDA(cudaEventRecord(evWc[k][cw], sW));
-                }
-            } else {
             const int jcw = (jb + WCH - 1) / WCH;
             for (int cw = 0; cw < WCH; cw++) {
                 const int j0 = cw * jcw;
@@ -2194,34 +1562,19 @@ int main(int argc, char **argv)
                                              kq, nrow, sW));
                 CHECK_CUDA(cudaEventRecord(evWc[k][cw], sW));
             }
-            }
-            /* delay probe: does the LAST chunk's W-broadcast completion sit
-             * on the critical path?  Injects a fixed spin AFTER the real
-             * broadcast finishes, delaying evReadyW[k] by exactly dlyW_us.
-             * If total runtime barely moves, W is fully hidden -- no
-             * transport optimization (compression, merging, ...) can help. */
-            static const long long dlyW_us =
-                getenv("CHPL2D_DLYW") ? atoll(getenv("CHPL2D_DLYW")) : 0;
-            if (dlyW_us > 0) spin_kernel<<<1, 1, 0, sW>>>(dlyW_us * 1980);
             CHECK_CUDA(cudaEventRecord(evReadyW[k], sW));
         }
         rec2(tSP, k, 6, sP);
         /* partner must have consumed the k-2 slices of this U buffer */
         if (k >= 2)
-            flag_wait_kernel<<<1, 1, 0, sP>>>(
-                peer[P * qc + ((pr + 1) % P)].flags + 3,
-                peer[P * qc + ((pr + 2) % P)].flags + 3,
-                peer[P * qc + ((pr + 3) % P)].flags + 3,
-                (long long)(k - 2) * 4 + 4);
+            flag_wait_kernel<<<1, 1, 0, sP>>>(peer[upartner].flags + 3,
+                                              nullptr, nullptr,
+                                              (long long)(k - 2) * 4 + 4);
         /* inv(L11) + inv(U11) pieces for U12 staging and the local M GEMMs */
-        if (pkgpre) {
-            CHECK_CUDA(cudaStreamWaitEvent(sP, evPkg[k], 0));
-        } else {
-            CHECK_NCCL(ncclBroadcast(d_pkg[b] + (size_t)jb * jb,
-                                     d_pkg[b] + (size_t)jb * jb,
-                                     (size_t)2 * jb * jb, ncclDouble, P * kq,
-                                     nworld, sP));
-        }
+        CHECK_NCCL(ncclBroadcast(d_pkg[b] + (size_t)jb * jb,
+                                 d_pkg[b] + (size_t)jb * jb,
+                                 (size_t)2 * jb * jb, ncclDouble, 2 * kq,
+                                 nworld, sP));
         emit_ready(prng[0][0] + prng[0][1]);
 
         /* remaining exchange groups, each followed immediately by the U12
@@ -2282,18 +1635,13 @@ int main(int argc, char **argv)
         chunks_of(k, rng);
 
         if (timing >= 2) CHECK_CUDA(cudaEventRecord(tS0[k][0], s0));
-        /* m-split consumes W row-chunk by row-chunk (evWc waits inside the
-         * update loops) -- no panel-wide W barrier on s0 in that mode */
-        if (!g8_msplit) CHECK_CUDA(cudaStreamWaitEvent(s0, evReadyW[k], 0));
+        CHECK_CUDA(cudaStreamWaitEvent(s0, evReadyW[k], 0));
         if (timing) CHECK_CUDA(cudaEventRecord(tU0[k], s0));
         const int use_oz = oz_on && mlb > 0;
         const int use_g8 = g8_on && mlb > 0;
-        const long long g8_rchw =
-            (use_g8 && g8_msplit) ? (mlb + WCH - 1) / WCH : 0;
         bool g8_first = true; /* first g8 call of a panel quantizes W;
                                  later tiles reuse it via skip_scalA */
-        if (wi8) { curSA = ozSAt[b]; curRs = ozRs2[b]; }
-        if (use_oz && !wi8) {
+        if (use_oz) {
             ozrowscale_kernel<<<(unsigned)((mlb + 255) / 256), 256, 0, s0>>>(
                 d_W[b], (size_t)mlb, (int)mlb, jb, ozRinv, ozRsc);
             dim3 blk(32, 8), grd((unsigned)((mlb + 31) / 32),
@@ -2311,15 +1659,9 @@ int main(int argc, char **argv)
                     /* B slices were produced tile-by-tile on sP with M */
                     oz_gemm(mlb, nc, jb, d_A + c0 * lda + blr0, c0 - tc0, s0);
                 } else if (use_g8 && nc >= OZ_MINN) {
-                    /* GEMMul8 path, m-split over the W row chunks: M per
-                     * tile on s0 (fp64, like fallback), then one CRT-
-                     * emulated C -= W_cw * M per row chunk.  Chunk cw is a
-                     * dense rn x jb block at d_W + r0*jb; waiting evWc per
-                     * chunk lets the first rows start while the rest of
-                     * the 4-GB W broadcast is still in flight.  Each chunk
-                     * keeps its own quantized-A slot (g8_workA[cw]) so
-                     * skip_scalA reuse works per chunk across all tiles of
-                     * the panel. */
+                    /* GEMMul8 path: M per tile on s0 (fp64, like fallback),
+                     * then the CRT-emulated C -= W*M with W quantized only
+                     * on the panel's first call */
                     for (long long t0 = 0; t0 < nc;) {
                         long long nt2 = std::min(G8_NT, nc - t0);
                         if (nc - t0 - nt2 > 0 && nc - t0 - nt2 < 1024)
@@ -2329,62 +1671,22 @@ int main(int argc, char **argv)
                             &done_, d_pkg[b] + (size_t)2 * jb * jb, jb,
                             d_U[b] + (size_t)(c0 + t0 - tc0) * jb, jb,
                             &dzero, d_Mg8, jb));
-                        if (!g8_msplit) {
-                            /* barrier mode (champion): one full-m call per
-                             * tile; W is whole (plain column-chunk layout,
-                             * evReadyW waited at panel top) */
-                            gemmul8::gemm<double, gemmul8::Backend::INT8>(
-                                hbG8, CUBLAS_OP_N, CUBLAS_OP_N, (size_t)mlb,
-                                (size_t)nt2, (size_t)jb, &dmone, d_W[b],
-                                (size_t)mlb, d_Mg8, (size_t)jb, &done_,
-                                d_A + (c0 + t0) * lda + blr0,
-                                (size_t)lda, G8_MODULI, G8_FAST != 0,
-                                g8_work, nullptr, nullptr,
-                                /*enable_skip_scalA=*/true,
-                                /*enable_skip_scalB=*/false,
-                                /*skip_scalA=*/!g8_first,
-                                /*skip_scalB=*/false);
-                        } else {
-                        bool tile_first = true; /* quantize B (M tile) only
-                                                   on the first row chunk;
-                                                   later chunks reuse the
-                                                   shared B_lo in g8_work */
-                        for (int cw = 0; cw < WCH; cw++) {
-                            const long long r0 = (long long)cw * g8_rchw;
-                            const long long rn = std::min(g8_rchw, mlb - r0);
-                            if (rn <= 0) break;
-                            CHECK_CUDA(
-                                cudaStreamWaitEvent(s0, evWc[k][cw], 0));
-                            gemmul8::gemm<double, gemmul8::Backend::INT8>(
-                                hbG8, CUBLAS_OP_N, CUBLAS_OP_N, (size_t)rn,
-                                (size_t)nt2, (size_t)jb, &dmone,
-                                d_W[b] + (size_t)r0 * jb, (size_t)rn,
-                                d_Mg8, (size_t)jb, &done_,
-                                d_A + (c0 + t0) * lda + blr0 + r0,
-                                (size_t)lda, G8_MODULI, G8_FAST != 0,
-                                g8_work, g8_workA[cw], nullptr,
-                                /*enable_skip_scalA=*/true,
-                                /*enable_skip_scalB=*/true,
-                                /*skip_scalA=*/!g8_first,
-                                /*skip_scalB=*/!tile_first);
-                            tile_first = false;
-                        }
-                        }
+                        gemmul8::gemm<double, gemmul8::Backend::INT8>(
+                            hbG8, CUBLAS_OP_N, CUBLAS_OP_N, (size_t)mlb,
+                            (size_t)nt2, (size_t)jb, &dmone, d_W[b],
+                            (size_t)mlb, d_Mg8, (size_t)jb, &done_,
+                            d_A + (c0 + t0) * lda + blr0, (size_t)lda,
+                            G8_MODULI, G8_FAST != 0, g8_work, nullptr,
+                            nullptr, /*enable_skip_scalA=*/true,
+                            /*enable_skip_scalB=*/false,
+                            /*skip_scalA=*/!g8_first,
+                            /*skip_scalB=*/false);
                         g8_first = false;
                         t0 += nt2;
                     }
                 } else {
                     /* fp64 fallback: M computed here on s0 (self-consistent,
-                     * no cross-stream buffer aliasing), tiled by XT.  In G8
-                     * mode W is row-packed (dense rn x jb blocks) and s0
-                     * skipped the panel-wide W barrier, so wait per chunk
-                     * and split the gemm by rows. */
-                    if (g8_msplit)
-                        for (int cw = 0; cw < WCH; cw++) {
-                            if ((long long)cw * g8_rchw >= mlb) break;
-                            CHECK_CUDA(
-                                cudaStreamWaitEvent(s0, evWc[k][cw], 0));
-                        }
+                     * no cross-stream buffer aliasing), tiled by XT */
                     for (long long t0 = 0; t0 < nc; t0 += XT) {
                         long long nt2 = std::min(XT, nc - t0);
                         CHECK_CUBLAS(cublasDgemm(
@@ -2392,27 +1694,10 @@ int main(int argc, char **argv)
                             &done_, d_pkg[b] + (size_t)2 * jb * jb, jb,
                             d_U[b] + (size_t)(c0 + t0 - tc0) * jb, jb,
                             &dzero, d_Ms, jb));
-                        if (g8_msplit) {
-                            for (int cw = 0; cw < WCH; cw++) {
-                                const long long r0 = (long long)cw * g8_rchw;
-                                const long long rn =
-                                    std::min(g8_rchw, mlb - r0);
-                                if (rn <= 0) break;
-                                CHECK_CUBLAS(cublasDgemm(
-                                    hb, CUBLAS_OP_N, CUBLAS_OP_N, (int)rn,
-                                    (int)nt2, jb, &dmone,
-                                    d_W[b] + (size_t)r0 * jb, (int)rn, d_Ms,
-                                    jb, &done_,
-                                    d_A + (c0 + t0) * lda + blr0 + r0,
-                                    (int)lda));
-                            }
-                        } else {
-                            CHECK_CUBLAS(cublasDgemm(
-                                hb, CUBLAS_OP_N, CUBLAS_OP_N, (int)mlb,
-                                (int)nt2, jb, &dmone, d_W[b], (int)mlb, d_Ms,
-                                jb, &done_,
-                                d_A + (c0 + t0) * lda + blr0, (int)lda));
-                        }
+                        CHECK_CUBLAS(cublasDgemm(
+                            hb, CUBLAS_OP_N, CUBLAS_OP_N, (int)mlb, (int)nt2,
+                            jb, &dmone, d_W[b], (int)mlb, d_Ms, jb, &done_,
+                            d_A + (c0 + t0) * lda + blr0, (int)lda));
                     }
                 }
             }
@@ -2526,9 +1811,7 @@ int main(int argc, char **argv)
              * d_tmp must first be released by its ncol partner */
             if (qc == jq)
                 flag_wait_kernel<<<1, 1, 0, s0>>>(
-                    peer[P * jq + ((jp + 1) % P)].flags + 4,
-                    peer[P * jq + ((jp + 2) % P)].flags + 4,
-                    peer[P * jq + ((jp + 3) % P)].flags + 4,
+                    peer[(1 - jp) + P * jq].flags + 4, nullptr, nullptr,
                     stepv - 1);
             long long dlr = lrows_below(gr0, NB, jp, N);
             CHECK_NCCL(ncclReduce(d_acc + dlr, d_tmp, jb, ncclDouble,
@@ -2540,7 +1823,7 @@ int main(int argc, char **argv)
             if (wce) {
                 /* nrow mates (and the ncol partner, for d_tmp reuse) must
                  * be past iteration j+1 */
-                std::vector<int> rp(Q > 0 ? Q - 1 : 0); { int t = 0;
+                int rp[7]; { int t = 0;
                     for (int q2 = 0; q2 < Q; q2++)
                         if (q2 != jq) rp[t++] = jp + P * q2; }
                 for (int t = 0; t < Q - 1; t += 3)
@@ -2550,9 +1833,7 @@ int main(int argc, char **argv)
                         t + 2 < Q - 1 ? peer[rp[t + 2]].flags + 4 : nullptr,
                         stepv - 1);
                 flag_wait_kernel<<<1, 1, 0, s0>>>(
-                    peer[P * jq + ((jp + 1) % P)].flags + 4,
-                    peer[P * jq + ((jp + 2) % P)].flags + 4,
-                    peer[P * jq + ((jp + 3) % P)].flags + 4,
+                    peer[(1 - jp) + P * jq].flags + 4, nullptr, nullptr,
                     stepv - 1);
                 for (int o = 0; o < Q - 1; o++)
                     CHECK_CUDA(cudaMemcpyAsync(d_tmp3 + (size_t)o * NB,
@@ -2564,9 +1845,7 @@ int main(int argc, char **argv)
                     d_tmp, d_acc + dlr, d_tmp3, NB, jb, Q - 1);
             } else {
                 flag_wait_kernel<<<1, 1, 0, s0>>>(
-                    peer[P * jq + ((jp + 1) % P)].flags + 4,
-                    peer[P * jq + ((jp + 2) % P)].flags + 4,
-                    peer[P * jq + ((jp + 3) % P)].flags + 4,
+                    peer[(1 - jp) + P * jq].flags + 4, nullptr, nullptr,
                     stepv - 1);
             }
             CHECK_CUBLAS(cublasDtrsv(hb, CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_N,

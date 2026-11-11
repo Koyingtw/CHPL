@@ -1,36 +1,22 @@
 /*
- * hpl_single.cu — single-process, single-GPU HPL solver, NO MPI/NCCL/IPC.
+ * chpl_single -- single-GPU HPL solver (no MPI / NCCL).
  *
- * Purpose: measure OUR Ozaki-I (base-128 digit slicing, fused-diagonal
- * cublasLt int8 GEMM) trailing-update scheme's TRUE single-GPU ceiling,
- * free of every distributed cost our production chpl2d.cu/chpl4x4.cu
- * carries (tournament pivoting across ranks, CE/IPC pulls, NCCL
- * broadcasts, preselect). This is the fair apples-to-apples counterpart
- * to a teammate's single-GPU hpl_ga.cu (which uses GEMMUL8/Ozaki-II).
+ * Exact partial-pivoting LU with NB-wide panels and an aggregated trailing
+ * update at K = AGG * NB. The trailing-update backend is selectable:
+ * native cuBLAS DGEMM, Ozaki-I int8 digit slicing, or GEMMul8 (Ozaki-II).
  *
- * Structure deliberately mirrors hpl_ga.cu's A3-agg two-level blocking
- * (exact partial-pivoting LU, NB panel width, aggregated trailing update
- * at K=AGG*NB) and its exact residual/timing/report format, so the two
- * numbers are directly comparable. The trailing-update BACKEND is what
- * differs: OUR Ozaki-I fused-diagonal int8 scheme instead of GEMMUL8's
- * Ozaki-II CRT scheme. Panel factorization, pivoting, row-swaps, and the
- * A3-agg block structure are new clean-room code (same well-known
- * algorithm, no distributed machinery — single rank never needs
- * tournament pivoting, cusolverDnXgetrf gives exact pivots directly).
+ * A is column-major on the GPU, N x (N+1), ld = N; b is stored as column N.
  *
- * Kernels ozrowscale/ozcolscale/ozsliceA/ozsliceB/ozrecon are copied
- * verbatim from src/chpl4x4.cu (they are already rank-independent,
- * single-GPU-only logic — no MPI/IPC touches them there either).
- *
- * A is column-major on GPU, N x (N+1), ld = N; b is stored as column N
- * (classic HPL trick: b rides through swaps/solves/updates automatically).
- *
- * CLI:  hpl_single N            one run, configured via HPLS_* env vars
- *       hpl_single --selftest   two small runs (native, ozaki); prints
- *                                SELFTEST_PASS / SELFTEST_FAIL
- * Env:  HPLS_NB=2048 HPLS_AGG=6 HPLS_NATIVE_TAIL=8192 HPLS_OZ_NT=1024
- *       HPLS_OZ_ALGO=3 HPLS_SEED=42 HPLS_BACKEND=native|ozaki
+ * CLI:  chpl_single N            one run, configured via HPLS_* env vars
+ *       chpl_single --selftest   small native/ozaki/gemmul8 runs
+ *       chpl_single --gemmtest m k n [oz_nt]
+ * Env:  HPLS_NB HPLS_AGG HPLS_BACKEND=native|ozaki|gemmul8 HPLS_SEED
+ *       HPLS_OZ_NT HPLS_OZ_ALGO HPLS_NATIVE_TAIL
+ *       HPLS_G8_MODULI HPLS_G8_FAST HPLS_G8_CHUNK HPLS_G8_SKIPA
  * Exit: 0 pass, 1 fail/error, 4 memory planner abort.
+ *
+ * Part of CHPL. SPDX-License-Identifier: BSD-3-Clause
+ * Derived from the netlib HPL-2.3 benchmark; see THIRD_PARTY_NOTICES.md.
  */
 
 #include <cublas_v2.h>
@@ -39,8 +25,7 @@
 #include <curand_kernel.h>
 #include <cusolverDn.h>
 
-#include <gemmul8.hpp> /* RIKEN Ozaki-II CRT emulation; minimal lib built by
-                          scripts/build_gemmul8_min.sh (double/INT8/gemm only) */
+#include <gemmul8.hpp> /* RIKEN GEMMul8 (Ozaki-II CRT DGEMM emulation) */
 
 #include <algorithm>
 #include <chrono>
@@ -57,7 +42,7 @@
     do {                                                                   \
         cudaError_t e_ = (call);                                          \
         if (e_ != cudaSuccess) {                                           \
-            std::fprintf(stderr, "[hpl_single] CUDA error %d (%s) at "    \
+            std::fprintf(stderr, "[chpl_single] CUDA error %d (%s) at "    \
                          "%s:%d\n", (int)e_, cudaGetErrorString(e_),      \
                          __FILE__, __LINE__);                             \
             std::exit(1);                                                  \
@@ -67,7 +52,7 @@
     do {                                                                   \
         cublasStatus_t e_ = (call);                                       \
         if (e_ != CUBLAS_STATUS_SUCCESS) {                                \
-            std::fprintf(stderr, "[hpl_single] cuBLAS error %d at "       \
+            std::fprintf(stderr, "[chpl_single] cuBLAS error %d at "       \
                          "%s:%d\n", (int)e_, __FILE__, __LINE__);         \
             std::exit(1);                                                  \
         }                                                                  \
@@ -76,14 +61,14 @@
     do {                                                                   \
         cusolverStatus_t e_ = (call);                                     \
         if (e_ != CUSOLVER_STATUS_SUCCESS) {                              \
-            std::fprintf(stderr, "[hpl_single] cusolver error %d at "     \
+            std::fprintf(stderr, "[chpl_single] cusolver error %d at "     \
                          "%s:%d\n", (int)e_, __FILE__, __LINE__);         \
             std::exit(1);                                                  \
         }                                                                  \
     } while (0)
 
 /* ------------------------------------------------------------------ */
-/* Matgen / residual kernels (same convention as hpl_ga.cu)            */
+/* Matgen / residual kernels             */
 /* ------------------------------------------------------------------ */
 __device__ __forceinline__ double hs_rand(uint64_t seed, uint64_t gi,
                                           uint64_t gj, uint64_t keyN)
@@ -157,7 +142,7 @@ static inline int grid1d(int64_t work, int block)
 }
 
 /* ------------------------------------------------------------------ */
-/* Ozaki-I kernels (verbatim from src/chpl4x4.cu; already rank-free)   */
+/* Ozaki-I kernels (shared with chpl_p4.cu)   */
 /* ------------------------------------------------------------------ */
 __global__ void ozrowscale_kernel(const double *A, size_t lda, int m, int k,
                                   double *rinv, double *rsc)
@@ -262,7 +247,7 @@ struct Cfg {
     int64_t oz_nt = 1024;
     int oz_algo = 3;
     int64_t native_tail = 8192;
-    /* gemmul8 backend knobs (teammate-matched defaults) */
+    /* gemmul8 backend knobs */
     int g8_moduli = 14;
     int g8_fast = 0;
     int64_t g8_chunk = 16384;
@@ -283,7 +268,7 @@ static int64_t env_i64(const char *name, int64_t dflt)
 }
 
 /* ------------------------------------------------------------------ */
-/* Phase clock (same design as hpl_ga.cu)                              */
+/* Phase clock                               */
 /* ------------------------------------------------------------------ */
 enum Phase { P_FACT = 0, P_INNER, P_LASWP, P_WTRSM, P_WGEMM, P_SOLVE, P_NPHASE };
 static const char *phase_name[P_NPHASE] = {"panel_fact", "inner_update",
@@ -402,7 +387,7 @@ struct Solver {
             freeB / gib, totB / gib, need <= freeB ? "OK" : "OVER BUDGET");
         std::fflush(stdout);
         if (need > freeB) {
-            std::fprintf(stderr, "[hpl_single] memory plan exceeds free HBM"
+            std::fprintf(stderr, "[chpl_single] memory plan exceeds free HBM"
                          " by %.2f GiB: reduce N or K (=AGG*NB)\n",
                          (need - freeB) / gib);
             std::exit(4);
@@ -466,7 +451,7 @@ struct Solver {
                     fwork_d / gib, fwork_h / gib);
         CUDA_CHECK(cudaMalloc(&d_fwork, fwork_d > 0 ? fwork_d : 8));
         h_fwork = std::malloc(fwork_h > 0 ? fwork_h : 8);
-        if (!h_fwork) { std::fprintf(stderr, "[hpl_single] host workspace alloc failed\n"); std::exit(1); }
+        if (!h_fwork) { std::fprintf(stderr, "[chpl_single] host workspace alloc failed\n"); std::exit(1); }
 
         ipiv_g.assign((size_t)N, 0);
         h_ipiv.resize((size_t)cfg.NB);
@@ -577,14 +562,14 @@ struct Solver {
                 std::min(n, cfg.oz_nt), m));
             CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(ozLt, opI, laD[d], lbD[d],
                 lcD[d], lcD[d], ozPref, 8, hD[d], &nh));
-            if (!nh) { std::fprintf(stderr, "[hpl_single] no int8 algo d=%d\n", d); std::exit(1); }
+            if (!nh) { std::fprintf(stderr, "[chpl_single] no int8 algo d=%d\n", d); std::exit(1); }
             if (nh > cfg.oz_algo) hD[d][0] = hD[d][cfg.oz_algo];
             if (ntail) {
                 CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&lbDt[d], CUDA_R_8I, kd, ntail, ldS));
                 CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&lcDt[d], CUDA_R_32I, m, ntail, m));
                 CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(ozLt, opI, laD[d], lbDt[d],
                     lcDt[d], lcDt[d], ozPref, 8, hDt[d], &nh));
-                if (!nh) { std::fprintf(stderr, "[hpl_single] no tail algo d=%d\n", d); std::exit(1); }
+                if (!nh) { std::fprintf(stderr, "[chpl_single] no tail algo d=%d\n", d); std::exit(1); }
                 if (nh > cfg.oz_algo) hDt[d][0] = hDt[d][cfg.oz_algo];
             }
         }
@@ -687,7 +672,7 @@ struct Solver {
                 int info = 0;
                 CUDA_CHECK(cudaMemcpy(&info, d_info, sizeof(int), cudaMemcpyDeviceToHost));
                 if (info != 0) {
-                    std::fprintf(stderr, "[hpl_single] getrf info=%d at jp=%" PRId64 "\n", info, jp);
+                    std::fprintf(stderr, "[chpl_single] getrf info=%d at jp=%" PRId64 "\n", info, jp);
                     std::exit(1);
                 }
                 CUDA_CHECK(cudaMemcpy(h_ipiv.data(), d_ipiv, (size_t)nb * sizeof(int64_t), cudaMemcpyDeviceToHost));
@@ -743,13 +728,13 @@ struct Solver {
 };
 
 /* ------------------------------------------------------------------ */
-/* run_case / report (mirrors hpl_ga.cu's format for direct comparison)*/
+/* run_case / report */
 /* ------------------------------------------------------------------ */
 static int run_case(const Cfg &cfg)
 {
     std::printf(
         "==========================================================\n"
-        "hpl_single: N=%" PRId64 " NB=%" PRId64 " AGG=%" PRId64 " K=%" PRId64
+        "chpl_single: N=%" PRId64 " NB=%" PRId64 " AGG=%" PRId64 " K=%" PRId64
         " backend=%s oz_nt=%" PRId64 " oz_algo=%d native_tail=%" PRId64
         " seed=%" PRIu64 "\n"
         "==========================================================\n",
@@ -873,11 +858,11 @@ static Cfg cfg_from_env(int64_t N)
     if (b && std::strcmp(b, "ozaki") == 0) c.backend = BK_OZAKI;
     else if (b && std::strcmp(b, "gemmul8") == 0) c.backend = BK_GEMMUL8;
     else if (b && std::strcmp(b, "native") != 0) {
-        std::fprintf(stderr, "[hpl_single] unknown HPLS_BACKEND '%s'\n", b);
+        std::fprintf(stderr, "[chpl_single] unknown HPLS_BACKEND '%s'\n", b);
         std::exit(1);
     }
     if (c.N <= 0 || c.NB <= 0 || c.AGG <= 0 || c.NB > c.N) {
-        std::fprintf(stderr, "[hpl_single] bad N/NB/AGG\n");
+        std::fprintf(stderr, "[chpl_single] bad N/NB/AGG\n");
         std::exit(1);
     }
     return c;
@@ -969,8 +954,8 @@ int main(int argc, char **argv)
         return gemmtest(std::atoll(argv[2]), std::atoll(argv[3]), std::atoll(argv[4]),
                         argc == 6 ? std::atoll(argv[5]) : -1);
     if (argc != 2) {
-        std::fprintf(stderr, "usage: hpl_single N | hpl_single --selftest | "
-                     "hpl_single --gemmtest m k n [oz_nt]\n"
+        std::fprintf(stderr, "usage: chpl_single N | chpl_single --selftest | "
+                     "chpl_single --gemmtest m k n [oz_nt]\n"
                      "env: HPLS_NB HPLS_AGG HPLS_BACKEND(native|ozaki|gemmul8) "
                      "HPLS_OZ_NT HPLS_OZ_ALGO HPLS_NATIVE_TAIL HPLS_SEED "
                      "HPLS_G8_MODULI HPLS_G8_FAST HPLS_G8_CHUNK HPLS_G8_SKIPA\n");
