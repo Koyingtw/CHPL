@@ -239,7 +239,7 @@ __global__ void ozrecon_kernel(double *C, size_t ldc, int m, int n,
 /* Config                                                              */
 /* ------------------------------------------------------------------ */
 enum Backend { BK_NATIVE = 0, BK_OZAKI = 1, BK_GEMMUL8 = 2 };
-static const int OZ_S = 6, OZ_D = 5; /* champion defaults: 47.7-bit */
+static const int OZ_S = 6, OZ_D = 5; /* default int8 slice count / diagonal depth (~47.7-bit) */
 
 struct Cfg {
     int64_t N = 0, NB = 2048, AGG = 6, K = 12288;
@@ -608,7 +608,7 @@ struct Solver {
             if (ntail) { cublasLtMatrixLayoutDestroy(lbDt[d]); cublasLtMatrixLayoutDestroy(lcDt[d]); }
         }
         cublasLtMatmulDescDestroy(opI);
-        CUDA_CHECK(cudaStreamSynchronize(sOz)); /* single-stream driver: keep it simple at A1 */
+        CUDA_CHECK(cudaStreamSynchronize(sOz)); /* single-stream driver: no cross-call overlap */
     }
 
     void update_trailing(int64_t J, int64_t KJ, int64_t mt, int64_t nt)

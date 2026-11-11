@@ -8,6 +8,8 @@ On H200 it outperforms the NVIDIA HPC-Benchmarks 26.02 container (same nodes, in
 | 8 × H200 (1 node) | 470.8 TFLOPS | 385.9 TFLOPS |
 | 16 × H200 (2 nodes) | 984.4 TFLOPS | 782.5 TFLOPS |
 
+Both were measured back to back on the same nodes. The best results per scale are listed under [Performance evaluation](#performance-evaluation).
+
 ## Requirements
 * Git
 * CMake (3.18 or later)
@@ -46,7 +48,7 @@ cd CHPL
 | Executable | Process grid | Use |
 |---|---|---|
 | `chpl_p4` | P = 4, Q = ranks / 4 | 2 or more nodes (P4Q4 on 16 GPUs, P4Q8 on 32 GPUs) |
-| `chpl_p2` | P = 2, Q = 4 or 8 | a single 8-GPU node |
+| `chpl_p2` | P = 2, Q = 4 or 8 (8 or 16 ranks) | a single 8-GPU node |
 | `chpl_single` | 1 GPU, no MPI | single-GPU runs |
 
 With the NVIDIA HPC SDK (MPI in `PATH`), for example:
@@ -62,7 +64,7 @@ mpirun_chpl -P <P> -Q <Q> -N <N> --NB <NB>
 # P       - is the number of rows in the MPI grid (1, 2 or 4)
 # Q       - is the number of columns in the MPI grid
 # N       - is the total number of rows/columns of the global matrix
-# NB      - is the panel size in the blocking algorithm (default 4096)
+# NB      - is the panel size in the blocking algorithm (default 4096; 1024 for -P 1 -Q 1)
 ```
 This run script will launch a total of np=PxQ MPI processes, one per GPU. `-P 1 -Q 1` runs `chpl_single` without MPI.
 
@@ -70,10 +72,11 @@ The second run mode takes an input file:
 ```
 mpirun_chpl -P <P> -Q <Q> -i <input>
 # where
-# input   - is the input filename (default HPL.dat)
+# input   - is the input filename (default: the HPL.dat installed next to the
+#           script, sized for 16 GPUs)
 ```
 
-The executables read the problem size, block size and residual threshold from a standard HPL input file (lines 6, 8 and 13). The process grid comes from the number of MPI ranks, so the remaining lines are ignored:
+The executables read the problem size, block size and residual threshold from a standard HPL input file (lines 6, 8 and 13). The process grid comes from the number of MPI ranks, so the remaining lines are ignored. If the file is missing or shorter than 13 lines, the executables fall back to N=16384, NB=1024:
 ```
 HPLinpack benchmark input file
 Innovative Computing Laboratory, University of Tennessee
@@ -107,23 +110,26 @@ CHPL is weak scaled so that the global matrix fills the memory of all GPUs. The 
 Performance is reported at the end of the run in FP64 floating point operations per second.
 
 ## Tuning
-`mpirun_chpl` sets the following defaults, and only for variables that are not already set in the environment.
+`mpirun_chpl` sets the following defaults for the MPI solvers, and only for variables that are not already set in the environment. The executables' built-in defaults are more conservative, so export these when launching the executables directly.
 
 | Variable | Default | Description |
 |---|---|---|
 | `CHPL2D_G8` | 1 | GEMMul8 (Ozaki-II) trailing update |
+| `CHPL2D_OZ` | 0 | Ozaki-I trailing update (used only when `CHPL2D_G8=0`) |
 | `CHPL2D_G8_MODULI` | 11 | number of moduli; 12 is more conservative (lower residual, about 5% slower) |
 | `CHPL2D_G8_FAST` | 1 | GEMMul8 fast mode |
 | `CHPL2D_G8_NT` | 3072 (P=2: 2816) | column tile width of the emulated GEMM |
 | `CHPL2D_PRESEL` / `CHPL2D_PRESEL2` | 1 / 1 | pivot preselection one panel ahead (stage 1 / stage 2, P=4 only) |
 | `CHPL2D_WCH` | 4 | number of chunks for the inter-node panel broadcast |
 | `CHPL2D_WS` | 64 | cuBLAS workspace in MB |
-| `CHPL2D_XT` | 6144 | row tile width for staging and row swaps |
+| `CHPL2D_XT` | 6144 | column tile width for the row exchange and staging |
 | `NCCL_MAX_NCHANNELS` / `NCCL_MIN_NCHANNELS` | 8 (P=2: 6) / 1 | fewer NCCL channels leave more SMs to the GEMM |
 | `NCCL_BUFFSIZE` | 2097152 | NCCL buffer size |
 | `CUDA_DEVICE_MAX_CONNECTIONS` | 32 | hardware work queues |
 
-`CHPL2D_OZ=1` (with `CHPL2D_G8=0`) selects the Ozaki-I digit-slicing backend instead, which works best with NB=2048. `chpl_single` is configured with `HPLS_*` variables; run it without arguments to list them.
+`CHPL2D_OZ=1` (with `CHPL2D_G8=0`) selects the Ozaki-I digit-slicing backend instead, which works best with NB=2048.
+
+`chpl_single` is configured with `HPLS_*` variables (run it without arguments to list them). For `-P 1 -Q 1`, `mpirun_chpl` sets `HPLS_BACKEND=gemmul8 HPLS_NB=1024 HPLS_AGG=8 HPLS_G8_MODULI=12 HPLS_G8_FAST=1 HPLS_G8_CHUNK=3072`.
 
 Notes:
 * NB=4096 is the best block size for the GEMMul8 backend. NB of 6144 or more exceeds the shared-memory limit of one of the kernels.

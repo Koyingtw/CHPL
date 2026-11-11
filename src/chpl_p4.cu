@@ -279,7 +279,7 @@ __device__ __forceinline__ long long d_lrb(long long g, int NB_, int P_,
 }
 
 /* build the net-permutation exchange lists from the winner row ids.
- * Sequential single-block port of the former host code (pairing of vacated
+ * Sequential single-block kernel (pairing of vacated
  * slots with displaced diagonal rows follows winner order; any deterministic
  * bijection is a valid pivoting choice).  Outputs the five d_rows lists and
  * cnt = {ng, nsend, n1, n2}. */
@@ -804,11 +804,11 @@ int main(int argc, char **argv)
     const long long G8_NT =
         getenv("CHPL2D_G8_NT") ? atoll(getenv("CHPL2D_G8_NT")) : 2048;
     /* m-split W pipeline (row-packed broadcast + per-chunk consumption).
-     * MEASURED NO NET GAIN at 2 nodes: it does hide the W-broadcast wait
-     * (s0_gap 17s -> 5s) but the hiding is capped by how much W-independent
-     * work exists per panel (~one tile), so the stall just moves inside the
-     * first tile (s0_gemm 48s -> 60s); wall unchanged.  Kept as an option
-     * for larger-scale experiments where the broadcast is longer. */
+     * Off by default: it hides the W-broadcast wait, but the hiding is
+     * capped by how much W-independent work exists per panel (~one tile),
+     * so at 2 nodes the stall just moves inside the first tile and wall
+     * time does not improve.  Kept as an option for larger scales where
+     * the broadcast is longer. */
     const int g8_msplit = g8_on &&
         (getenv("CHPL2D_G8_MSPLIT") ? atoi(getenv("CHPL2D_G8_MSPLIT")) : 0);
     if (g8_on) oz_on = 0; /* the two update engines are mutually exclusive */
@@ -2048,9 +2048,9 @@ int main(int argc, char **argv)
              * array).  Root additionally tight-slices straight into ozSAt
              * (exact, same as v1); non-root unpacks the wire into ozSAt
              * (tight, for the digit GEMMs) and reconstructs d_W in one
-             * pass.  This halves the per-chunk NCCL call count, which is
-             * what made plain WI8 (v1) get WORSE as node count grew (nrow
-             * spans more physical nodes -> more per-call network hops). */
+             * pass.  This halves the per-chunk NCCL call count; per-call
+             * cost is what limits plain WI8 (v1) as the node count grows
+             * (nrow spans more physical nodes -> more per-call network hops). */
             CHECK_CUDA(cudaEventRecord(evXg0[k], sP));
             CHECK_CUDA(cudaStreamWaitEvent(sW, evXg0[k], 0));
             if (k >= 2)
@@ -2334,7 +2334,7 @@ int main(int argc, char **argv)
                             d_U[b] + (size_t)(c0 + t0 - tc0) * jb, jb,
                             &dzero, d_Mg8, jb));
                         if (!g8_msplit) {
-                            /* barrier mode (champion): one full-m call per
+                            /* barrier mode (default): one full-m call per
                              * tile; W is whole (plain column-chunk layout,
                              * evReadyW waited at panel top) */
                             gemmul8::gemm<double, gemmul8::Backend::INT8>(

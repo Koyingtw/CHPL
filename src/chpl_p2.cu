@@ -248,7 +248,7 @@ __device__ __forceinline__ long long d_lrb(long long g, int NB_, int pr_)
 }
 
 /* build the net-permutation exchange lists from the winner row ids.
- * Sequential single-block port of the former host code (pairing of vacated
+ * Sequential single-block kernel (pairing of vacated
  * slots with displaced diagonal rows follows winner order; any deterministic
  * bijection is a valid pivoting choice).  Outputs the five d_rows lists and
  * cnt = {ng, nsend, n1, n2}. */
